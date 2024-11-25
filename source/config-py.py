@@ -11,7 +11,7 @@ HELIUS_WEBHOOK_ID = os.getenv('HELIUS_WEBHOOK_ID')
 WEBHOOK_URL = os.getenv('WEBHOOK_URL')
 
 # Admin Configuration
-ADMIN_IDS = ['your_telegram_id']  # Replace with your Telegram ID
+ADMIN_IDS = ['1086229166']  # Replace with your Telegram ID
 
 # User Plans
 class UserPlan:
