@@ -9,19 +9,9 @@ import logging
 from datetime import datetime
 import requests
 from pymongo import MongoClient
-
-# Import configurations directly
-BOT_TOKEN = os.environ.get('BOT_TOKEN')
-MONGODB_URI = os.environ.get('MONGODB_URI')
-HELIUS_KEY = os.environ.get('HELIUS_KEY')
-
-class UserPlan:
-    FREE = "free"
-    PREMIUM = "premium"
-
-class UserLimits:
-    FREE_WALLET_LIMIT = 3
-    PREMIUM_WALLET_LIMIT = 10
+from database_utils import DatabaseManager
+from premium_utils import PremiumManager
+from source.config import UserPlan, UserLimits
 
 # Set up logging
 logging.basicConfig(
@@ -40,77 +30,11 @@ try:
     
     # Initialize utility managers
     db_manager = DatabaseManager(db)
-    premium_manager = PremiumManager(db)
+    premium_manager = PremiumManager(db, db_manager)
     
 except Exception as e:
     logger.error(f"Failed to connect to MongoDB: {e}")
     raise
-
-class DatabaseManager:
-    def __init__(self, db):
-        self.db = db
-
-    def ensure_user_exists(self, user_id: str, username: str = None) -> None:
-        try:
-            existing_user = self.db.users.find_one({"user_id": str(user_id)})
-            if not existing_user:
-                self.db.users.insert_one({
-                    "user_id": str(user_id),
-                    "username": username,
-                    "plan": UserPlan.FREE,
-                    "joined_date": datetime.now(),
-                    "status": "active"
-                })
-                logger.info(f"Created new user: {user_id}")
-        except Exception as e:
-            logger.error(f"Error ensuring user exists: {e}")
-
-    def get_user_stats(self, user_id: str) -> dict:
-        try:
-            active_wallets = self.db.wallets.count_documents({
-                "user_id": str(user_id),
-                "status": "active"
-            })
-            
-            today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
-            transactions_today = self.db.messages.count_documents({
-                "user": str(user_id),
-                "datetime": {"$gte": today}
-            })
-            
-            user_data = self.db.users.find_one({"user_id": str(user_id)}) or {
-                "plan": UserPlan.FREE,
-                "joined_date": datetime.now()
-            }
-            
-            return {
-                "active_wallets": active_wallets,
-                "transactions_today": transactions_today,
-                "plan": user_data.get("plan", UserPlan.FREE),
-                "wallet_limit": UserLimits.PREMIUM_WALLET_LIMIT if user_data.get("plan") == UserPlan.PREMIUM else UserLimits.FREE_WALLET_LIMIT
-            }
-        except Exception as e:
-            logger.error(f"Error getting user stats: {e}")
-            return {
-                "active_wallets": 0,
-                "transactions_today": 0,
-                "plan": UserPlan.FREE,
-                "wallet_limit": UserLimits.FREE_WALLET_LIMIT
-            }
-
-class PremiumManager:
-    def __init__(self, db):
-        self.db = db
-
-    def is_premium(self, user_id: str) -> bool:
-        try:
-            user = self.db.users.find_one({"user_id": str(user_id)})
-            return user and user.get("plan") == UserPlan.PREMIUM
-        except Exception as e:
-            logger.error(f"Error checking premium status: {e}")
-            return False
-
-# Rest of your existing app.py code remains the same...
 
 # Flask app setup and routes
 app = Flask(__name__)
