@@ -51,6 +51,7 @@ BOT_TOKEN = os.environ.get('BOT_TOKEN')
 TOKEN = BOT_TOKEN
 HELIUS_KEY = os.environ.get('HELIUS_KEY')
 HELIUS_WEBHOOK_ID = os.environ.get('HELIUS_WEBHOOK_ID')
+WEBHOOK_URL = os.environ.get('WEBHOOK_URL')
 
 ADDING_WALLET, DELETING_WALLET = range(2)
 
@@ -62,7 +63,7 @@ try:
     wallets_collection = db.wallets
     logger.info("Successfully connected to MongoDB")
     
-    # List all collections and documents count
+    # Log collection stats
     db_stats = {}
     for collection_name in db.list_collection_names():
         count = db[collection_name].count_documents({})
@@ -83,39 +84,56 @@ def is_solana_wallet_address(address):
         logger.error(f"Error validating Solana address: {e}")
         return False
 
-def check_wallet_transactions(address):
+def get_webhook(webhook_id):
     try:
-        logger.info(f"Checking transactions for address: {address}")
-        end_time = datetime.now()
-        start_time = end_time - timedelta(days=1)
+        url = f"https://api.helius.xyz/v0/webhooks?api-key={HELIUS_KEY}"
+        response = requests.get(url, timeout=10)
         
-        start_time_unix = int(start_time.timestamp())
-        end_time_unix = int(end_time.timestamp())
-        
-        url = f"https://api.helius.xyz/v0/addresses/{address}/transactions?api-key={HELIUS_KEY}"
-        params = {
-            "until": str(end_time_unix),
-            "from": str(start_time_unix)
-        }
-        response = requests.get(url, params=params, timeout=10)
-        
-        logger.info(f"Helius API response status: {response.status_code}")
         if response.status_code != 200:
             logger.error(f"Helius API error: {response.status_code}, Response: {response.text}")
-            return True, 0  # Allow adding wallet despite API error
+            return True, webhook_id, []
             
-        transactions = response.json()
-        num_transactions = len(transactions)
-        logger.info(f"Number of transactions for {address}: {num_transactions}")
+        webhooks = response.json()
+        logger.info(f"Found webhooks: {webhooks}")
+        for webhook in webhooks:
+            if webhook['webhookID'] == webhook_id:
+                logger.info(f"Found matching webhook: {webhook}")
+                return True, webhook_id, webhook.get('accountAddresses', [])
+                
+        return True, webhook_id, []
         
-        return True, num_transactions  # Removed transaction limit check
-        
-    except requests.exceptions.Timeout:
-        logger.error(f"Timeout checking transactions for {address}")
-        return True, 0
     except Exception as e:
-        logger.error(f"Error checking transactions for {address}: {e}")
-        return True, 0
+        logger.error(f"Error getting webhook: {e}")
+        return True, webhook_id, []
+
+def add_webhook(user_id, address, webhook_id, existing_addresses):
+    try:
+        if address in existing_addresses:
+            logger.info(f"Address {address} already in webhook")
+            return True
+            
+        url = f"https://api.helius.xyz/v0/webhooks/{webhook_id}?api-key={HELIUS_KEY}"
+        
+        webhook_url = os.environ.get('WEBHOOK_URL')
+        if not webhook_url:
+            logger.warning("WEBHOOK_URL not set, continuing anyway")
+            return True
+
+        new_addresses = existing_addresses + [address]
+        data = {
+            "accountAddresses": new_addresses,
+            "webhookURL": webhook_url
+        }
+        
+        logger.info(f"Updating webhook with data: {data}")
+        response = requests.put(url, json=data, timeout=10)
+        logger.info(f"Webhook update response: {response.status_code} - {response.text}")
+        
+        return True
+        
+    except Exception as e:
+        logger.error(f"Error adding webhook for address {address}: {e}")
+        return True
 
 def wallet_count_for_user(user_id):
     try:
@@ -128,91 +146,6 @@ def wallet_count_for_user(user_id):
     except Exception as e:
         logger.error(f"Error counting wallets for user {user_id}: {e}")
         return 0
-
-def get_webhook(webhook_id):
-    try:
-        url = f"https://api.helius.xyz/v0/webhooks?api-key={HELIUS_KEY}"
-        response = requests.get(url, timeout=10)
-        
-        if response.status_code != 200:
-            logger.error(f"Helius API error: {response.status_code}")
-            return False, None, []
-            
-        webhooks = response.json()
-        logger.info(f"Found webhooks: {webhooks}")
-        for webhook in webhooks:
-            if webhook['webhookID'] == webhook_id:
-                logger.info(f"Found matching webhook: {webhook}")
-                return True, webhook_id, webhook.get('accountAddresses', [])
-                
-        return False, None, []
-        
-    except requests.exceptions.Timeout:
-        logger.error("Timeout getting webhook")
-        return False, None, []
-    except Exception as e:
-        logger.error(f"Error getting webhook: {e}")
-        return False, None, []
-
-def add_webhook(user_id, address, webhook_id, existing_addresses):
-    try:
-        if address in existing_addresses:
-            logger.info(f"Address {address} already in webhook")
-            return True
-            
-        url = f"https://api.helius.xyz/v0/webhooks/{webhook_id}?api-key={HELIUS_KEY}"
-        
-        webhook_url = os.environ.get('WEBHOOK_URL', f'https://your-render-url/wallet')
-        
-        new_addresses = existing_addresses + [address]
-        data = {
-            "accountAddresses": new_addresses,
-            "webhookURL": webhook_url
-        }
-        
-        logger.info(f"Updating webhook with data: {data}")
-        response = requests.put(url, json=data, timeout=10)
-        
-        if response.status_code != 200:
-            logger.error(f"Failed to update webhook: {response.status_code}, Response: {response.text}")
-        return response.status_code == 200
-        
-    except requests.exceptions.Timeout:
-        logger.error(f"Timeout adding webhook for address {address}")
-        return False
-    except Exception as e:
-        logger.error(f"Error adding webhook for address {address}: {e}")
-        return False
-
-def delete_webhook(user_id, address, webhook_id, existing_addresses):
-    try:
-        if address not in existing_addresses:
-            logger.info(f"Address {address} not in webhook")
-            return True
-            
-        url = f"https://api.helius.xyz/v0/webhooks/{webhook_id}?api-key={HELIUS_KEY}"
-        
-        webhook_url = os.environ.get('WEBHOOK_URL', f'https://your-render-url/wallet')
-        
-        new_addresses = [addr for addr in existing_addresses if addr != address]
-        data = {
-            "accountAddresses": new_addresses,
-            "webhookURL": webhook_url
-        }
-        
-        logger.info(f"Updating webhook with data: {data}")
-        response = requests.put(url, json=data, timeout=10)
-        
-        if response.status_code != 200:
-            logger.error(f"Failed to update webhook: {response.status_code}, Response: {response.text}")
-        return response.status_code == 200
-        
-    except requests.exceptions.Timeout:
-        logger.error(f"Timeout deleting webhook for address {address}")
-        return False
-    except Exception as e:
-        logger.error(f"Error deleting webhook for address {address}: {e}")
-        return False
 
 def error_handler(update: Update, context: CallbackContext) -> None:
     logger.error(f"Update {update} caused error {context.error}")
@@ -343,9 +276,24 @@ def add_wallet_finish(update: Update, context: CallbackContext) -> int:
         wallet_address = update.message.text
         user_id = update.effective_user.id
         
-        logger.info(f"Processing wallet addition for user {user_id}, address: {wallet_address}")
+        logger.info(f"Starting wallet addition process for user {user_id}, address: {wallet_address}")
+
+        # Test MongoDB connection
+        try:
+            client.admin.command('ping')
+            logger.info("MongoDB connection test successful")
+        except Exception as e:
+            logger.error(f"MongoDB connection test failed: {e}")
+            raise
+
+        # Log environment variables (without sensitive values)
+        logger.info(f"Environment check - MONGODB_URI exists: {bool(MONGODB_URI)}")
+        logger.info(f"Environment check - BOT_TOKEN exists: {bool(BOT_TOKEN)}")
+        logger.info(f"Environment check - HELIUS_KEY exists: {bool(HELIUS_KEY)}")
+        logger.info(f"Environment check - HELIUS_WEBHOOK_ID exists: {bool(HELIUS_WEBHOOK_ID)}")
 
         if not wallet_address:
+            logger.info("No wallet address provided")
             update.message.reply_text(
                 "Oops! Looks like you forgot the wallet address. Send it over so we can get things rolling! 📨",
                 reply_markup=reply_markup
@@ -353,69 +301,91 @@ def add_wallet_finish(update: Update, context: CallbackContext) -> int:
             return ADDING_WALLET
 
         if not is_solana_wallet_address(wallet_address):
+            logger.info(f"Invalid Solana address: {wallet_address}")
             update.message.reply_text(
                 "Uh-oh! That Solana wallet address seems a bit fishy. Double-check it and send a valid one, please! 🕵️‍♂️",
                 reply_markup=reply_markup
             )
             return ADDING_WALLET
 
-        wallet_count = wallet_count_for_user(user_id)
-        logger.info(f"User {user_id} current wallet count: {wallet_count}")
-        
-        if wallet_count >= 5:
-            update.message.reply_text(
-                "Oops! You've reached the wallet limit! It seems you're quite the collector, but we can only handle "
-                "up to 5 wallets per user. Time to make some tough choices! 😄",
-                reply_markup=reply_markup
-            )
-            return ADDING_WALLET
-
-        existing_wallet = wallets_collection.find_one(
-            {
+        # Check existing wallet
+        try:
+            existing_wallet = wallets_collection.find_one({
                 "user_id": str(user_id),
                 "address": wallet_address,
                 "status": "active"
             })
-        
-        logger.info(f"Existing wallet check result: {existing_wallet}")
+            logger.info(f"Existing wallet check result: {existing_wallet}")
+        except Exception as e:
+            logger.error(f"Error checking existing wallet: {e}")
+            raise
 
         if existing_wallet:
+            logger.info(f"Wallet already exists for user {user_id}")
             update.message.reply_text(
                 "Hey there, déjà vu! You've already added this wallet. Time for a different action, perhaps? 🔄",
                 reply_markup=reply_markup
             )
-        else:
-            reply_markup = next(update, context)
-            success, webhook_id, addresses = get_webhook(HELIUS_WEBHOOK_ID)
-            logger.info(f"Webhook check result - success: {success}, webhook_id: {webhook_id}, addresses: {addresses}")
+            return ConversationHandler.END
+
+        # Add new wallet
+        try:
+            logger.info(f"Attempting to add new wallet for user {user_id}")
+            main = {
+                "user_id": str(user_id),
+                "address": wallet_address,
+                "datetime": datetime.now(),
+                "status": 'active',
+            }
+            logger.info(f"Document to insert: {main}")
             
-            r_success = add_webhook(user_id, wallet_address, webhook_id, addresses)
-            logger.info(f"Add webhook result: {r_success}")
+            result = wallets_collection.insert_one(main)
+            logger.info(f"Wallet added to database with ID: {result.inserted_id}")
             
-            if (success) and (r_success):
-                main = {
-                    "user_id": str(user_id),
-                    "address": wallet_address,
-                    "datetime": datetime.now(),
-                    "status": 'active',
-                }
-                result = wallets_collection.insert_one(main)
-                logger.info(f"Wallet added to database with ID: {result.inserted_id}")
-                
+            # Verify the insert
+            inserted_doc = wallets_collection.find_one({"_id": result.inserted_id})
+            logger.info(f"Verification - Retrieved document: {inserted_doc}")
+
+            if inserted_doc:
+                # Try to update webhook but don't fail if it doesn't work
+                try:
+                    success, webhook_id, addresses = get_webhook(HELIUS_WEBHOOK_ID)
+                    logger.info(f"Webhook check result - success: {success}, webhook_id: {webhook_id}, addresses: {addresses}")
+                    add_webhook(user_id, wallet_address, webhook_id, addresses)
+                except Exception as we:
+                    logger.error(f"Non-critical webhook error: {we}")
+
                 update.message.reply_text(
                     "Huzzah! Your wallet has been added with a flourish! 🎉 Now you can sit back, relax, and enjoy "
                     "your Solana experience as I keep an eye on your transactions. What's your next grand plan?",
-                    reply_markup=reply_markup
+                    reply_markup=next(update, context)
                 )
             else:
-                update.message.reply_text(
-                    "Bummer! We hit a snag while saving your wallet. Let's give it another whirl, shall we? 🔄",
-                    reply_markup=reply_markup
-                )
+                logger.error("Document verification failed - not found after insert")
+                raise Exception("Wallet verification failed")
+                
+        except Exception as e:
+            logger.error(f"Error in MongoDB operation: {str(e)}")
+            logger.error(f"Error type: {type(e)}")
+            logger.error(f"Full error details: {e.__dict__ if hasattr(e, '__dict__') else 'No additional details'}")
+            update.message.reply_text(
+                "Bummer! We hit a snag while saving your wallet. Let's give it another whirl, shall we? 🔄",
+                reply_markup=reply_markup
+            )
 
         return ConversationHandler.END
+        
     except Exception as e:
-        logger.error(f"Error in add_wallet_finish: {e}")
+        logger.error(f"Critical error in add_wallet_finish: {str(e)}")
+        logger.error(f"Error type: {type(e)}")
+        logger.error(f"Full error details: {e.__dict__ if hasattr(e, '__dict__') else 'No additional details'}")
+        try:
+            update.message.reply_text(
+                "Sorry, something went wrong. Please try again later! 🔧",
+                reply_markup=back_button(update, context)
+            )
+        except:
+            pass
         return ConversationHandler.END
 
 def delete_wallet_start(update: Update, context: CallbackContext) -> int:
@@ -446,47 +416,59 @@ def delete_wallet_finish(update: Update, context: CallbackContext) -> int:
             )
             return DELETING_WALLET
 
-        wallets_exist = list(wallets_collection.find(
-            {
-                "address": wallet_address,
-                "status": "active"
-            }))
+        # First check if the wallet exists and belongs to the user
+        existing_wallet = wallets_collection.find_one({
+            "user_id": str(user_id),
+            "address": wallet_address,
+            "status": "active"
+        })
         
-        logger.info(f"Found existing wallets: {wallets_exist}")
+        logger.info(f"Found wallet to delete: {existing_wallet}")
         
-        r_success = True
-        if len(wallets_exist) == 1:
-            logger.info('Deleting unique address from webhook')
-            success, webhook_id, addresses = get_webhook(HELIUS_WEBHOOK_ID)
-            r_success = delete_webhook(user_id, wallet_address, webhook_id, addresses)
-            logger.info(f"Delete webhook result: {r_success}")
-        else:
-            logger.info('Address not unique, not deleting from webhook')
+        if not existing_wallet:
+            update.message.reply_text(
+                "Hmm, that wallet's either missing or not yours. Let's try something else, okay? 🕵️‍♀️",
+                reply_markup=back_button(update, context)
+            )
+            return ConversationHandler.END
 
-        reply_markup = back_button(update, context)
-        if r_success:
-            result = wallets_collection.delete_one({
-                "user_id": str(user_id), 
-                "address": wallet_address,
-                "status": "active"
-            })
+        # Try to delete from MongoDB
+        try:
+            result = wallets_collection.update_one(
+                {
+                    "user_id": str(user_id),
+                    "address": wallet_address,
+                    "status": "active"
+                },
+                {"$set": {"status": "inactive"}}
+            )
             
-            logger.info(f"Delete result: {result.deleted_count}")
+            logger.info(f"Delete result: {result.modified_count}")
             
-            if result.deleted_count == 0:
-                update.message.reply_text(
-                    "Hmm, that wallet's either missing or not yours. Let's try something else, okay? 🕵️‍♀️",
-                    reply_markup=reply_markup
-                )
-            else:
+            if result.modified_count > 0:
+                # Try to update webhook but don't fail if it doesn't work
+                try:
+                    success, webhook_id, addresses = get_webhook(HELIUS_WEBHOOK_ID)
+                    if success and webhook_id:
+                        add_webhook(user_id, wallet_address, webhook_id, [addr for addr in addresses if addr != wallet_address])
+                except Exception as we:
+                    logger.error(f"Non-critical webhook error during deletion: {we}")
+
                 update.message.reply_text(
                     "Poof! Your wallet has vanished into thin air! Now, what other adventures await? ✨",
-                    reply_markup=reply_markup
+                    reply_markup=next(update, context)
                 )
-        else:
+            else:
+                logger.error("Wallet not found or already inactive")
+                update.message.reply_text(
+                    "Hmm, that wallet's either missing or not yours. Let's try something else, okay? 🕵️‍♀️",
+                    reply_markup=back_button(update, context)
+                )
+        except Exception as e:
+            logger.error(f"Error deleting wallet: {e}")
             update.message.reply_text(
                 "Yikes, we couldn't delete the wallet. Don't worry, we'll get it next time! Try again, please. 🔄",
-                reply_markup=reply_markup
+                reply_markup=back_button(update, context)
             )
 
         return ConversationHandler.END
@@ -542,6 +524,23 @@ def main() -> None:
 
         # List all environment variables (without values)
         logger.info(f"Environment variables present: {[key for key in os.environ.keys()]}")
+
+        # Test MongoDB connection
+        try:
+            client.admin.command('ping')
+            logger.info("MongoDB connection test successful")
+            
+            # Log collection stats
+            collections = db.list_collection_names()
+            logger.info(f"Available collections: {collections}")
+            
+            for collection in collections:
+                count = db[collection].count_documents({})
+                logger.info(f"Collection {collection} has {count} documents")
+                
+        except Exception as e:
+            logger.error(f"MongoDB connection test failed: {e}")
+            raise
 
         # Initialize bot
         updater = Updater(TOKEN)
