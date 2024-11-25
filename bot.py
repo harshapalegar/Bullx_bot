@@ -13,15 +13,17 @@ from pymongo import MongoClient
 from datetime import datetime, timedelta
 from telegram.error import BadRequest, Unauthorized, TimedOut
 
-# Import configurations directly
+# Environment variables
 BOT_TOKEN = os.environ.get('BOT_TOKEN')
 MONGODB_URI = os.environ.get('MONGODB_URI')
 HELIUS_KEY = os.environ.get('HELIUS_KEY')
 HELIUS_WEBHOOK_ID = os.environ.get('HELIUS_WEBHOOK_ID')
 
-# Define constants
+# Constants
 ADMIN_IDS = ['your_telegram_id']  # Replace with your Telegram ID
+ADDING_WALLET, ADDING_NAME, DELETING_WALLET = range(3)
 
+# User Plan classes
 class UserPlan:
     FREE = "free"
     PREMIUM = "premium"
@@ -30,16 +32,220 @@ class UserLimits:
     FREE_WALLET_LIMIT = 3
     PREMIUM_WALLET_LIMIT = 10
 
-# States for conversation handler
-ADDING_WALLET, ADDING_NAME, DELETING_WALLET = range(3)
+# Database Manager Class
+class DatabaseManager:
+    def __init__(self, db):
+        self.db = db
 
-# Set up logging
-logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO,
-    handlers=[logging.StreamHandler()]
-)
-logger = logging.getLogger(__name__)
+    def ensure_user_exists(self, user_id: str, username: str = None) -> None:
+        try:
+            existing_user = self.db.users.find_one({"user_id": str(user_id)})
+            if not existing_user:
+                self.db.users.insert_one({
+                    "user_id": str(user_id),
+                    "username": username,
+                    "plan": UserPlan.FREE,
+                    "joined_date": datetime.now(),
+                    "status": "active"
+                })
+                logger.info(f"Created new user: {user_id}")
+        except Exception as e:
+            logger.error(f"Error ensuring user exists: {e}")
+
+    def get_user_stats(self, user_id: str) -> dict:
+        try:
+            active_wallets = self.db.wallets.count_documents({
+                "user_id": str(user_id),
+                "status": "active"
+            })
+            
+            today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+            transactions_today = self.db.messages.count_documents({
+                "user": str(user_id),
+                "datetime": {"$gte": today}
+            })
+            
+            user_data = self.db.users.find_one({"user_id": str(user_id)}) or {
+                "plan": UserPlan.FREE,
+                "joined_date": datetime.now()
+            }
+            
+            return {
+                "active_wallets": active_wallets,
+                "transactions_today": transactions_today,
+                "plan": user_data.get("plan", UserPlan.FREE),
+                "wallet_limit": UserLimits.PREMIUM_WALLET_LIMIT if user_data.get("plan") == UserPlan.PREMIUM else UserLimits.FREE_WALLET_LIMIT
+            }
+        except Exception as e:
+            logger.error(f"Error getting user stats: {e}")
+            return {
+                "active_wallets": 0,
+                "transactions_today": 0,
+                "plan": UserPlan.FREE,
+                "wallet_limit": UserLimits.FREE_WALLET_LIMIT
+            }
+
+    def add_wallet(self, user_id: str, wallet_address: str, wallet_name: str) -> bool:
+        try:
+            existing_wallet = self.db.wallets.find_one({
+                "user_id": str(user_id),
+                "address": wallet_address,
+                "status": "active"
+            })
+            
+            if existing_wallet:
+                return False
+                
+            self.db.wallets.insert_one({
+                "user_id": str(user_id),
+                "address": wallet_address,
+                "name": wallet_name,
+                "datetime": datetime.now(),
+                "status": "active"
+            })
+            logger.info(f"Added wallet {wallet_address} for user {user_id}")
+            return True
+        except Exception as e:
+            logger.error(f"Error adding wallet: {e}")
+            return False
+
+    def delete_wallet(self, user_id: str, wallet_name: str) -> bool:
+        try:
+            result = self.db.wallets.update_one(
+                {
+                    "user_id": str(user_id),
+                    "name": wallet_name,
+                    "status": "active"
+                },
+                {"$set": {"status": "inactive"}}
+            )
+            logger.info(f"Deleted wallet {wallet_name} for user {user_id}")
+            return result.modified_count > 0
+        except Exception as e:
+            logger.error(f"Error deleting wallet: {e}")
+            return False
+
+    def get_user_wallets(self, user_id: str) -> list:
+        try:
+            return list(self.db.wallets.find({
+                "user_id": str(user_id),
+                "status": "active"
+            }))
+        except Exception as e:
+            logger.error(f"Error getting user wallets: {e}")
+            return []
+
+# Premium Manager Class
+class PremiumManager:
+    def __init__(self, db):
+        self.db = db
+
+    def is_premium(self, user_id: str) -> bool:
+        try:
+            user = self.db.users.find_one({"user_id": str(user_id)})
+            return user and user.get("plan") == UserPlan.PREMIUM
+        except Exception as e:
+            logger.error(f"Error checking premium status: {e}")
+            return False
+
+    def upgrade_to_premium(self, user_id: str) -> bool:
+        try:
+            result = self.db.users.update_one(
+                {"user_id": str(user_id)},
+                {
+                    "$set": {
+                        "plan": UserPlan.PREMIUM,
+                        "premium_since": datetime.now()
+                    }
+                }
+            )
+            return result.modified_count > 0
+        except Exception as e:
+            logger.error(f"Error upgrading to premium: {e}")
+            return False
+
+# Admin System Class
+class AdminSystem:
+    def __init__(self, db):
+        self.db = db
+        self._admin_ids = ADMIN_IDS
+
+    def is_admin(self, user_id: str) -> bool:
+        return str(user_id) in self._admin_ids
+
+    def get_system_stats(self):
+        try:
+            today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+            return {
+                "total_users": len(set(w["user_id"] for w in self.db.wallets.find({"status": "active"}))),
+                "total_wallets": self.db.wallets.count_documents({"status": "active"}),
+                "premium_users": self.db.users.count_documents({"plan": UserPlan.PREMIUM}),
+                "active_today": len(set(m["user"] for m in self.db.messages.find({"datetime": {"$gte": today}}))),
+                "transactions_today": self.db.messages.count_documents({"datetime": {"$gte": today}})
+            }
+        except Exception as e:
+            logger.error(f"Error getting system stats: {e}")
+            return {
+                "total_users": 0,
+                "total_wallets": 0,
+                "premium_users": 0,
+                "active_today": 0,
+                "transactions_today": 0
+            }
+
+# Helius API functions
+def is_solana_wallet_address(address: str) -> bool:
+    try:
+        decoded = base58.b58decode(address)
+        return len(decoded) == 32
+    except Exception as e:
+        logger.error(f"Error validating Solana address: {e}")
+        return False
+
+def get_webhook(webhook_id: str):
+    try:
+        url = f"https://api.helius.xyz/v0/webhooks?api-key={HELIUS_KEY}"
+        response = requests.get(url, timeout=10)
+        
+        if response.status_code != 200:
+            logger.error(f"Helius API error: {response.status_code}")
+            return True, webhook_id, []
+            
+        webhooks = response.json()
+        for webhook in webhooks:
+            if webhook['webhookID'] == webhook_id:
+                return True, webhook_id, webhook.get('accountAddresses', [])
+                
+        return True, webhook_id, []
+        
+    except Exception as e:
+        logger.error(f"Error getting webhook: {e}")
+        return True, webhook_id, []
+
+def add_webhook(user_id: str, address: str, webhook_id: str, existing_addresses: list) -> bool:
+    try:
+        if address in existing_addresses:
+            return True
+            
+        url = f"https://api.helius.xyz/v0/webhooks/{webhook_id}?api-key={HELIUS_KEY}"
+        
+        webhook_url = os.environ.get('WEBHOOK_URL')
+        if not webhook_url:
+            logger.warning("WEBHOOK_URL not set, continuing anyway")
+            return True
+
+        new_addresses = existing_addresses + [address]
+        data = {
+            "accountAddresses": new_addresses,
+            "webhookURL": webhook_url
+        }
+        
+        response = requests.put(url, json=data, timeout=10)
+        return True
+        
+    except Exception as e:
+        logger.error(f"Error adding webhook for address {address}: {e}")
+        return True
 
 # Health check server
 class HealthCheckHandler(BaseHTTPRequestHandler):
@@ -61,26 +267,35 @@ def run_health_check_server():
     except Exception as e:
         logger.error(f"Error in health check server: {e}")
 
+# Set up logging
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO,
+    handlers=[logging.StreamHandler()]
+)
+logger = logging.getLogger(__name__)
+
 # Start health check server
 health_check_thread = threading.Thread(target=run_health_check_server, daemon=True)
 health_check_thread.start()
 
-# Initialize MongoDB and utilities
+# Initialize MongoDB and managers
 try:
     client = MongoClient(MONGODB_URI, serverSelectionTimeoutMS=5000)
     client.admin.command('ping')
     db = client.sol_wallets
     logger.info("Successfully connected to MongoDB")
-
-    # Initialize utility managers
-    admin_system = AdminSystem(db)
+    
+    # Initialize managers
     db_manager = DatabaseManager(db)
     premium_manager = PremiumManager(db)
+    admin_system = AdminSystem(db)
     
 except Exception as e:
     logger.error(f"Failed to connect to MongoDB: {e}")
     raise
 
+# Command Handlers
 def error_handler(update: Update, context: CallbackContext) -> None:
     logger.error(f"Update {update} caused error {context.error}")
     try:
@@ -148,6 +363,13 @@ def start(update: Update, context: CallbackContext) -> None:
         logger.error(f"Error in start command: {e}")
         if update.message:
             update.message.reply_text("Sorry, something went wrong. Please try /start again!")
+
+def cancel(update: Update, context: CallbackContext) -> int:
+    update.message.reply_text(
+        "Operation cancelled. Send /start to begin again.",
+        reply_markup=ReplyKeyboardRemove()
+    )
+    return ConversationHandler.END
 
 def add_wallet_start(update: Update, context: CallbackContext) -> int:
     try:
@@ -239,7 +461,7 @@ def handle_wallet_name(update: Update, context: CallbackContext) -> int:
             update.message.reply_text("Something went wrong. Please start over with /add")
             return ConversationHandler.END
 
-        # Add wallet to database
+        # Add wallet
         success = db_manager.add_wallet(user_id, wallet_address, wallet_name)
         if not success:
             update.message.reply_text(
@@ -254,7 +476,6 @@ def handle_wallet_name(update: Update, context: CallbackContext) -> int:
         except Exception as e:
             logger.error(f"Error updating webhook: {e}")
 
-        # Successful addition message
         message = (
             f"✅ Successfully added wallet!\n\n"
             f"*Name:* {wallet_name}\n"
@@ -328,9 +549,13 @@ def show_wallets(update: Update, context: CallbackContext) -> None:
     except Exception as e:
         logger.error(f"Error showing wallets: {e}")
         try:
-            update.message.reply_text("Sorry, something went wrong. Please try again!")
+            error_text = "Sorry, something went wrong. Please try again!"
+            if isinstance(update.callback_query, CallbackQuery):
+                update.callback_query.edit_message_text(error_text)
+            else:
+                update.message.reply_text(error_text)
         except:
-            update.callback_query.edit_message_text("Sorry, something went wrong. Please try again!")
+            pass
 
 def delete_wallet_start(update: Update, context: CallbackContext) -> int:
     try:
@@ -387,247 +612,19 @@ def delete_wallet_start(update: Update, context: CallbackContext) -> int:
         logger.error(f"Error in delete_wallet_start: {e}")
         return ConversationHandler.END
 
-def handle_delete_callback(update: Update, context: CallbackContext) -> int:
-    try:
-        query = update.callback_query
-        user_id = str(update.effective_user.id)
-        
-        if query.data == "start":
-            start(update, context)
-            return ConversationHandler.END
-            
-        wallet_name = query.data.replace("delete_", "")
-        success = db_manager.delete_wallet(user_id, wallet_name)
-        
-        if success:
-            message = f"Successfully deleted wallet '*{wallet_name}*'! 🗑️"
-        else:
-            message = "Couldn't find that wallet. It might have been already deleted! 🤔"
-            
-        keyboard = [
-            [
-                InlineKeyboardButton("👀 Show Wallets", callback_data="show_wallets"),
-                InlineKeyboardButton("🔙 Main Menu", callback_data="start")
-            ]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        query.answer()
-        query.edit_message_text(
-            message,
-            reply_markup=reply_markup,
-            parse_mode=ParseMode.MARKDOWN
-        )
-        return ConversationHandler.END
-        
-    except Exception as e:
-        logger.error(f"Error handling delete callback: {e}")
-        return ConversationHandler.END
-
-# Admin Commands
-def admin_panel(update: Update, context: CallbackContext) -> None:
-    try:
-        user_id = str(update.effective_user.id)
-        if not admin_system.is_admin(user_id):
-            update.message.reply_text("⚠️ Access denied")
-            return
-
-        stats = admin_system.get_system_stats()
-        
-        message = (
-            "*🔐 Admin Panel*\n\n"
-            f"*System Statistics:*\n"
-            f"Total Users: `{stats['total_users']}`\n"
-            f"Total Wallets: `{stats['total_wallets']}`\n"
-            f"Premium Users: `{stats['premium_users']}`\n"
-            f"Active Today: `{stats['active_users_today']}`\n"
-            f"Today's Transactions: `{stats['transactions_today']}`\n\n"
-            "*Admin Commands:*\n"
-            "/admin_users - List all users\n"
-            "/admin_stats - Detailed statistics\n"
-            "/broadcast - Send message to all users\n"
-            "/add_premium <user_id> - Add premium user\n"
-        )
-
-        keyboard = [[InlineKeyboardButton("🔙 Main Menu", callback_data="start")]]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-
-        if isinstance(update.callback_query, CallbackQuery):
-            update.callback_query.answer()
-            update.callback_query.edit_message_text(
-                message,
-                reply_markup=reply_markup,
-                parse_mode=ParseMode.MARKDOWN
-            )
-        else:
-            update.message.reply_text(
-                message,
-                reply_markup=reply_markup,
-                parse_mode=ParseMode.MARKDOWN
-            )
-
-    except Exception as e:
-        logger.error(f"Error in admin panel: {e}")
-        update.message.reply_text("Sorry, something went wrong!")
-
-def admin_users(update: Update, context: CallbackContext) -> None:
-    try:
-        user_id = str(update.effective_user.id)
-        if not admin_system.is_admin(user_id):
-            update.message.reply_text("⚠️ Access denied")
-            return
-
-        users = admin_system.get_user_list()
-        
-        messages = ["*👥 User List*\n"]
-        current_message = ""
-        
-        for user in users:
-            user_info = (
-                f"\n*User ID:* `{user['user_id']}`\n"
-                f"Username: @{user.get('username', 'None')}\n"
-                f"Plan: `{user['plan']}`\n"
-                f"Wallets: `{user['wallets']}`\n"
-                f"Today's Transactions: `{user['transactions_today']}`\n"
-                f"Joined: `{user['joined_date'].strftime('%Y-%m-%d')}`\n"
-                "───────────────\n"
-            )
-            
-            if len(current_message + user_info) > 4000:
-                messages.append(current_message)
-                current_message = user_info
-            else:
-                current_message += user_info
-        
-        if current_message:
-            messages.append(current_message)
-        
-        # Send messages
-        for idx, message in enumerate(messages):
-            if idx == len(messages) - 1:
-                keyboard = [[InlineKeyboardButton("🔙 Admin Panel", callback_data="admin")]]
-                reply_markup = InlineKeyboardMarkup(keyboard)
-                update.message.reply_text(
-                    message,
-                    reply_markup=reply_markup,
-                    parse_mode=ParseMode.MARKDOWN
-                )
-            else:
-                update.message.reply_text(
-                    message,
-                    parse_mode=ParseMode.MARKDOWN
-                )
-
-    except Exception as e:
-        logger.error(f"Error in admin users command: {e}")
-        update.message.reply_text("Sorry, something went wrong!")
-
-def broadcast(update: Update, context: CallbackContext) -> None:
-    try:
-        user_id = str(update.effective_user.id)
-        if not admin_system.is_admin(user_id):
-            update.message.reply_text("⚠️ Access denied")
-            return
-
-        if not context.args:
-            update.message.reply_text(
-                "Usage: /broadcast <message>\n"
-                "Use HTML formatting for styling."
-            )
-            return
-
-        broadcast_message = " ".join(context.args)
-        results = admin_system.broadcast_message(broadcast_message)
-
-        update.message.reply_text(
-            f"Broadcast completed!\n"
-            f"Success: {results['success']}\n"
-            f"Failed: {results['failed']}"
-        )
-
-    except Exception as e:
-        logger.error(f"Error in broadcast command: {e}")
-        update.message.reply_text("Sorry, something went wrong!")
-
-def add_premium(update: Update, context: CallbackContext) -> None:
-    try:
-        user_id = str(update.effective_user.id)
-        if not admin_system.is_admin(user_id):
-            update.message.reply_text("⚠️ Access denied")
-            return
-
-        if not context.args:
-            update.message.reply_text("Usage: /add_premium <user_id>")
-            return
-
-        target_user_id = context.args[0]
-        success = premium_manager.upgrade_to_premium(target_user_id)
-
-        if success:
-            update.message.reply_text(f"Successfully upgraded user {target_user_id} to Premium! ⭐️")
-        else:
-            update.message.reply_text("Failed to upgrade user. Please check the user ID.")
-
-    except Exception as e:
-        logger.error(f"Error in add premium command: {e}")
-        update.message.reply_text("Sorry, something went wrong!")
-
-# Premium Features
-def premium_command(update: Update, context: CallbackContext) -> None:
-    try:
-        user_id = str(update.effective_user.id)
-        is_premium = premium_manager.is_premium(user_id)
-        
-        if is_premium:
-            message = (
-                "*⭐️ Premium Status*\n\n"
-                "You are a Premium user!\n\n"
-                "*Your Benefits:*\n"
-                f"• Up to {UserLimits.PREMIUM_WALLET_LIMIT} wallets\n"
-                "• Custom wallet names\n"
-                "• Priority notifications\n"
-                "• Detailed transaction history\n"
-                "• Advanced analytics\n\n"
-                "Thank you for your support! 🙏"
-            )
-        else:
-            message = premium_manager.format_premium_message()
-
-        keyboard = [[InlineKeyboardButton("🔙 Main Menu", callback_data="start")]]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-
-        if isinstance(update.callback_query, CallbackQuery):
-            update.callback_query.answer()
-            update.callback_query.edit_message_text(
-                message,
-                reply_markup=reply_markup,
-                parse_mode=ParseMode.MARKDOWN
-            )
-        else:
-            update.message.reply_text(
-                message,
-                reply_markup=reply_markup,
-                parse_mode=ParseMode.MARKDOWN
-            )
-
-    except Exception as e:
-        logger.error(f"Error in premium command: {e}")
-        update.message.reply_text("Sorry, something went wrong!")
-
 def stats_command(update: Update, context: CallbackContext) -> None:
     try:
         user_id = str(update.effective_user.id)
         stats = db_manager.get_user_stats(user_id)
-        is_premium = premium_manager.is_premium(user_id)
-
+        
         if admin_system.is_admin(user_id):
-            admin_stats = admin_system.get_system_stats()
+            system_stats = admin_system.get_system_stats()
             message = (
                 "*📊 Admin Statistics*\n\n"
-                f"Total Users: `{admin_stats['total_users']}`\n"
-                f"Total Wallets: `{admin_stats['total_wallets']}`\n"
-                f"Premium Users: `{admin_stats['premium_users']}`\n"
-                f"Active Today: `{admin_stats['active_users_today']}`\n\n"
+                f"Total Users: `{system_stats['total_users']}`\n"
+                f"Total Wallets: `{system_stats['total_wallets']}`\n"
+                f"Premium Users: `{system_stats['premium_users']}`\n"
+                f"Active Today: `{system_stats['active_today']}`\n\n"
                 "*Your Statistics:*\n"
                 f"Active Wallets: `{stats['active_wallets']}/{stats['wallet_limit']}`\n"
                 f"Transactions Today: `{stats['transactions_today']}`\n"
@@ -640,11 +637,12 @@ def stats_command(update: Update, context: CallbackContext) -> None:
                 f"Transactions Today: `{stats['transactions_today']}`\n"
                 f"Plan: `{stats['plan'].title()}`\n\n"
             )
-            if not is_premium:
+            if stats['plan'] == UserPlan.FREE:
                 message += (
                     "*Want more features? Get Premium!*\n"
                     f"• Increase limit to {UserLimits.PREMIUM_WALLET_LIMIT} wallets\n"
-                    "• Get priority notifications\n"
+                    "• Custom wallet names\n"
+                    "• Priority notifications\n"
                     "Use /premium to learn more!"
                 )
 
@@ -667,6 +665,56 @@ def stats_command(update: Update, context: CallbackContext) -> None:
 
     except Exception as e:
         logger.error(f"Error in stats command: {e}")
+        update.message.reply_text("Sorry, something went wrong!")
+
+def premium_command(update: Update, context: CallbackContext) -> None:
+    try:
+        user_id = str(update.effective_user.id)
+        is_premium = premium_manager.is_premium(user_id)
+        
+        if is_premium:
+            message = (
+                "*⭐️ Premium Status*\n\n"
+                "You are a Premium user!\n\n"
+                "*Your Benefits:*\n"
+                f"• Up to {UserLimits.PREMIUM_WALLET_LIMIT} wallets\n"
+                "• Custom wallet names\n"
+                "• Priority notifications\n"
+                "• Detailed transaction history\n"
+                "• Advanced analytics\n\n"
+                "Thank you for your support! 🙏"
+            )
+        else:
+            message = (
+                "*🌟 Premium Features*\n\n"
+                "Upgrade to Premium and get:\n"
+                f"• Monitor up to {UserLimits.PREMIUM_WALLET_LIMIT} wallets\n"
+                "• Custom wallet names\n"
+                "• Priority notifications\n"
+                "• Detailed transaction history\n"
+                "• Advanced analytics\n\n"
+                "Contact @your_username to upgrade!"
+            )
+
+        keyboard = [[InlineKeyboardButton("🔙 Main Menu", callback_data="start")]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+
+        if isinstance(update.callback_query, CallbackQuery):
+            update.callback_query.answer()
+            update.callback_query.edit_message_text(
+                message,
+                reply_markup=reply_markup,
+                parse_mode=ParseMode.MARKDOWN
+            )
+        else:
+            update.message.reply_text(
+                message,
+                reply_markup=reply_markup,
+                parse_mode=ParseMode.MARKDOWN
+            )
+
+    except Exception as e:
+        logger.error(f"Error in premium command: {e}")
         update.message.reply_text("Sorry, something went wrong!")
 
 def main() -> None:
@@ -713,17 +761,10 @@ def main() -> None:
         dispatcher.add_handler(CommandHandler("stats", stats_command))
         dispatcher.add_handler(CommandHandler("premium", premium_command))
 
-        # Admin commands
-        dispatcher.add_handler(CommandHandler("admin", admin_panel))
-        dispatcher.add_handler(CommandHandler("admin_users", admin_users))
-        dispatcher.add_handler(CommandHandler("broadcast", broadcast))
-        dispatcher.add_handler(CommandHandler("add_premium", add_premium))
-
-        # Callback query handlers
+        # Add callback query handlers
         dispatcher.add_handler(CallbackQueryHandler(show_wallets, pattern='^show_wallets$'))
         dispatcher.add_handler(CallbackQueryHandler(stats_command, pattern='^stats$'))
         dispatcher.add_handler(CallbackQueryHandler(premium_command, pattern='^premium$'))
-        dispatcher.add_handler(CallbackQueryHandler(admin_panel, pattern='^admin$'))
         dispatcher.add_handler(CallbackQueryHandler(start, pattern='^start$'))
 
         # Add error handler
