@@ -13,14 +13,22 @@ from pymongo import MongoClient
 from datetime import datetime, timedelta
 from telegram.error import BadRequest, Unauthorized, TimedOut
 
-# Import configurations and utilities
-from source.config import (
-    BOT_TOKEN, MONGODB_URI, HELIUS_KEY, HELIUS_WEBHOOK_ID, 
-    UserPlan, UserLimits
-)
-from source.utils.admin_utils import AdminSystem
-from source.utils.database_utils import DatabaseManager
-from source.utils.premium_utils import PremiumManager
+# Import configurations directly
+BOT_TOKEN = os.environ.get('BOT_TOKEN')
+MONGODB_URI = os.environ.get('MONGODB_URI')
+HELIUS_KEY = os.environ.get('HELIUS_KEY')
+HELIUS_WEBHOOK_ID = os.environ.get('HELIUS_WEBHOOK_ID')
+
+# Define constants
+ADMIN_IDS = ['your_telegram_id']  # Replace with your Telegram ID
+
+class UserPlan:
+    FREE = "free"
+    PREMIUM = "premium"
+
+class UserLimits:
+    FREE_WALLET_LIMIT = 3
+    PREMIUM_WALLET_LIMIT = 10
 
 # States for conversation handler
 ADDING_WALLET, ADDING_NAME, DELETING_WALLET = range(3)
