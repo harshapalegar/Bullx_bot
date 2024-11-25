@@ -10,6 +10,14 @@ from datetime import datetime
 import requests
 from pymongo import MongoClient
 
+# Import configurations and utilities
+from source.config import (
+    BOT_TOKEN, MONGODB_URI, HELIUS_KEY,
+    UserPlan, UserLimits
+)
+from source.utils.database_utils import DatabaseManager
+from source.utils.premium_utils import PremiumManager
+
 # Set up logging
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -18,59 +26,60 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Environment variables
-MONGODB_URI = os.environ.get('MONGODB_URI')
-BOT_TOKEN = os.environ.get('BOT_TOKEN')
-HELIUS_KEY = os.environ.get('HELIUS_KEY')
-
-# MongoDB setup
+# Initialize MongoDB and utilities
 try:
     client = MongoClient(MONGODB_URI, serverSelectionTimeoutMS=5000)
-    # Test connection
     client.admin.command('ping')
+    db = client.sol_wallets
     logger.info("Successfully connected to MongoDB")
     
-    db = client.sol_wallets
-    wallets_collection = db.wallets
-    
-    # List all collections and documents count
-    db_stats = {}
-    for collection_name in db.list_collection_names():
-        count = db[collection_name].count_documents({})
-        db_stats[collection_name] = count
-    logger.info(f"Database statistics: {db_stats}")
+    # Initialize utility managers
+    db_manager = DatabaseManager(db)
+    premium_manager = PremiumManager(db)
     
 except Exception as e:
-    logger.error(f"Could not connect to MongoDB: {e}")
+    logger.error(f"Failed to connect to MongoDB: {e}")
     raise
 
-def send_message_to_user(bot_token, user_id, message):
+def send_message_to_user(bot_token, user_id, message, priority=False):
     try:
         request = Request(con_pool_size=8)
         bot = Bot(bot_token, request=request)
+        
+        # Add priority indicator for premium users
+        if priority and premium_manager.is_premium(user_id):
+            message = "🔔 *Priority Alert*\n\n" + message
+            
         bot.send_message(
             chat_id=user_id,
             text=message,
             parse_mode="Markdown",
-            disable_web_page_preview=True)
+            disable_web_page_preview=True
+        )
         logger.info(f"Successfully sent message to user {user_id}")
     except Exception as e:
         logger.error(f"Error sending message to user {user_id}: {e}")
 
-def send_image_to_user(bot_token, user_id, message, image_url):
+def send_image_to_user(bot_token, user_id, message, image_url, priority=False):
     try:
         request = Request(con_pool_size=8)
         bot = Bot(bot_token, request=request)
+        
+        # Add priority indicator for premium users
+        if priority and premium_manager.is_premium(user_id):
+            message = "🔔 *Priority Alert*\n\n" + message
+            
         image_bytes = get_image(image_url)
         bot.send_photo(
             chat_id=user_id,
             photo=image_bytes,
             caption=message,
-            parse_mode="Markdown")
+            parse_mode="Markdown"
+        )
         logger.info(f"Successfully sent image message to user {user_id}")
     except Exception as e:
         logger.error(f"Error sending image to user {user_id}: {e}")
-        send_message_to_user(bot_token, user_id, message)    
+        send_message_to_user(bot_token, user_id, message, priority)    
     
 def get_image(url):
     try:
@@ -150,7 +159,7 @@ def check_image(data):
 
 def create_message(data):
     try:
-        logger.info(f"Received webhook data: {data}")
+        logger.info(f"Processing transaction data: {data}")
         
         tx_type = data[0]['type'].replace("_", " ")
         tx = data[0]['signature']
@@ -170,46 +179,57 @@ def create_message(data):
         logger.info(f"Found accounts in transaction: {accounts}")
         image = check_image(data)
         
-        # Debug: Check all wallets in database
-        all_wallets = list(wallets_collection.find({"status": "active"}))
-        logger.info(f"All active wallets in database: {all_wallets}")
-        
-        # Find users with these accounts
-        found_docs = list(wallets_collection.find(
-            {
-                "address": {"$in": accounts},
-                "status": "active"
-            }
-        ))
+        # Find affected wallets
+        found_docs = list(db.wallets.find({
+            "address": {"$in": accounts},
+            "status": "active"
+        }))
         
         logger.info(f"Found wallet documents: {found_docs}")
-        found_users = [i['user_id'] for i in found_docs]
-        found_users = set(found_users)
-        logger.info(f"Found users for notification: {found_users}")
+        
+        # Get unique users and check their premium status
+        found_users = set(doc['user_id'] for doc in found_docs)
+        priority_users = set(
+            user_id for user_id in found_users 
+            if premium_manager.is_premium(user_id)
+        )
+        
+        logger.info(f"Found users: {found_users}, Priority users: {priority_users}")
         
         messages = []
         for user in found_users:
+            is_priority = user in priority_users
             if source != "SYSTEM_PROGRAM":
                 message = f'*{tx_type}* on {source}'
             else:
                 message = f'*{tx_type}*'
+                
             if len(description) > 0:
                 message = message + '\n\n' + data[0]['description']
-
                 user_wallets = [i['address'] for i in found_docs if i['user_id']==user]
-                logger.info(f"User {user} wallets: {user_wallets}")
-                for user_wallet in user_wallets:
-                    if user_wallet not in message:
+                
+                for wallet in user_wallets:
+                    if wallet not in message:
                         continue
-                    formatted_user_wallet = user_wallet[:4] + '...' + user_wallet[-4:]
-                    message = message.replace(user_wallet, f'*YOUR WALLET* ({formatted_user_wallet})')
+                    # Get custom name for wallet if it exists
+                    wallet_doc = next((doc for doc in found_docs if doc['address'] == wallet), None)
+                    if wallet_doc and 'name' in wallet_doc:
+                        formatted_name = wallet_doc['name']
+                    else:
+                        formatted_name = f"{wallet[:4]}...{wallet[-4:]}"
+                    message = message.replace(wallet, f'*{formatted_name}*')
 
             formatted_text = re.sub(r'[A-Za-z0-9]{32,44}', format_wallet_address, message)
             formatted_text = formatted_text + f'\n[XRAY](https://xray.helius.xyz/tx/{tx}) | [Solscan](https://solscan.io/tx/{tx})'
             formatted_text = formatted_text.replace("#", "").replace("_", " ")
-            messages.append({'user': user, 'text': formatted_text, 'image': image})
+            
+            messages.append({
+                'user': user,
+                'text': formatted_text,
+                'image': image,
+                'priority': is_priority
+            })
         
-        logger.info(f"Created messages: {messages}")
         return messages
     except Exception as e:
         logger.error(f"Error creating message: {e}")
@@ -220,33 +240,37 @@ app = Flask(__name__)
 
 @app.route('/', methods=['GET'])
 def health_check():
-    return jsonify({"status": "ok"}), 200
-
-@app.route('/webhook-health', methods=['GET'])
-def webhook_health():
-    # Test MongoDB connection
     try:
+        # Test MongoDB connection
         client.admin.command('ping')
         mongo_status = "connected"
     except Exception as e:
         mongo_status = f"error: {str(e)}"
-    
+        
     return jsonify({
         "status": "ok",
         "timestamp": datetime.now().isoformat(),
-        "service": "solana-webhook",
-        "mongodb_status": mongo_status,
-        "environment_variables": {
+        "mongo_status": mongo_status,
+        "environment": {
             "MONGODB_URI": bool(MONGODB_URI),
             "BOT_TOKEN": bool(BOT_TOKEN),
             "HELIUS_KEY": bool(HELIUS_KEY)
         }
     }), 200
 
+@app.route('/webhook-health', methods=['GET'])
+def webhook_health():
+    return jsonify({
+        "status": "ok",
+        "timestamp": datetime.now().isoformat(),
+        "service": "solana-webhook"
+    }), 200
+
 @app.route('/wallet', methods=['POST'])
 def handle_webhook():
     try:
         logger.info(f"Received webhook request: {request.headers}")
+        
         if not request.is_json:
             logger.error("Invalid request: Not JSON")
             return jsonify({"error": "Invalid request"}), 400
@@ -263,22 +287,40 @@ def handle_webhook():
 
         for message in messages:
             try:
+                # Save message to database
                 db_entry = {
                     "user": message['user'],
                     "message": message['text'],
-                    "datetime": datetime.now()
+                    "datetime": datetime.now(),
+                    "is_priority": message['priority']
                 }
                 db.messages.insert_one(db_entry)
-                logger.info(f"Saved message to database: {db_entry}")
 
+                # Send notification
                 if len(message['image']) > 0:
                     try:
-                        send_image_to_user(BOT_TOKEN, message['user'], message['text'], message['image'])
+                        send_image_to_user(
+                            BOT_TOKEN,
+                            message['user'],
+                            message['text'],
+                            message['image'],
+                            message['priority']
+                        )
                     except Exception as e:
                         logger.error(f"Error sending image, falling back to text: {e}")
-                        send_message_to_user(BOT_TOKEN, message['user'], message['text'])    
+                        send_message_to_user(
+                            BOT_TOKEN,
+                            message['user'],
+                            message['text'],
+                            message['priority']
+                        )    
                 else:
-                    send_message_to_user(BOT_TOKEN, message['user'], message['text'])
+                    send_message_to_user(
+                        BOT_TOKEN,
+                        message['user'],
+                        message['text'],
+                        message['priority']
+                    )
             except Exception as e:
                 logger.error(f"Error processing message: {e}")
 
