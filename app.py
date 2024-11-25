@@ -1,4 +1,4 @@
-from flask import Flask, request
+from flask import Flask, request, jsonify
 from telegram import Bot
 from telegram.utils.request import Request
 from PIL import Image
@@ -28,167 +28,216 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 def send_message_to_user(bot_token, user_id, message):
-    request = Request(con_pool_size=8)
-    bot = Bot(bot_token, request=request)
-    bot.send_message(
-        chat_id=user_id,
-        text=message,
-        parse_mode="Markdown",
-        disable_web_page_preview=True)
+    try:
+        request = Request(con_pool_size=8)
+        bot = Bot(bot_token, request=request)
+        bot.send_message(
+            chat_id=user_id,
+            text=message,
+            parse_mode="Markdown",
+            disable_web_page_preview=True)
+    except Exception as e:
+        logger.error(f"Error sending message to user {user_id}: {e}")
 
 def send_image_to_user(bot_token, user_id, message, image_url):
-    request = Request(con_pool_size=8)
-    bot = Bot(bot_token, request=request)
-    image_bytes = get_image(image_url)
-    bot.send_photo(
-        chat_id=user_id,
-        photo=image_bytes,
-        caption=message,
-        parse_mode="Markdown")
+    try:
+        request = Request(con_pool_size=8)
+        bot = Bot(bot_token, request=request)
+        image_bytes = get_image(image_url)
+        bot.send_photo(
+            chat_id=user_id,
+            photo=image_bytes,
+            caption=message,
+            parse_mode="Markdown")
+    except Exception as e:
+        logger.error(f"Error sending image to user {user_id}: {e}")
+        send_message_to_user(bot_token, user_id, message)    
     
 def get_image(url):
-    response = requests.get(url).content
-    image = Image.open(BytesIO(response))
-    image = image.convert('RGB')
-    max_size = (800, 800)
-    image.thumbnail(max_size, Image.LANCZOS)  # Updated from ANTIALIAS
-    image_bytes = BytesIO()
-    image.save(image_bytes, 'JPEG', quality=85)
-    image_bytes.seek(0)
-    return image_bytes
+    try:
+        response = requests.get(url, timeout=10).content
+        image = Image.open(BytesIO(response))
+        image = image.convert('RGB')
+        max_size = (800, 800)
+        image.thumbnail(max_size, Image.LANCZOS)
+        image_bytes = BytesIO()
+        image.save(image_bytes, 'JPEG', quality=85)
+        image_bytes.seek(0)
+        return image_bytes
+    except Exception as e:
+        logger.error(f"Error getting image from {url}: {e}")
+        raise
 
 def format_wallet_address(match_obj):
     wallet_address = match_obj.group(0)
     return wallet_address[:4] + "..." + wallet_address[-4:]
 
 def get_compressed_image(asset_id):
-    url = f'https://rpc.helius.xyz/?api-key={HELIUS_KEY}'
-    r_data = {
-        "jsonrpc": "2.0",
-        "id": "my-id",
-        "method": "getAsset",
-        "params": [
-            asset_id
-        ]
-    }
-    r = requests.post(url, json=r_data)
-    url_meta = r.json()['result']['content']['json_uri']
-    r = requests.get(url=url_meta)
-    return r.json()['image']
+    try:
+        url = f'https://rpc.helius.xyz/?api-key={HELIUS_KEY}'
+        r_data = {
+            "jsonrpc": "2.0",
+            "id": "my-id",
+            "method": "getAsset",
+            "params": [
+                asset_id
+            ]
+        }
+        r = requests.post(url, json=r_data, timeout=10)
+        url_meta = r.json()['result']['content']['json_uri']
+        r = requests.get(url=url_meta, timeout=10)
+        return r.json()['image']
+    except Exception as e:
+        logger.error(f"Error getting compressed image for asset {asset_id}: {e}")
+        return ''
 
 def check_image(data):
-    token_mint = ''
-    for token in data[0]['tokenTransfers']:
-        if 'NonFungible' in token['tokenStandard']:
-            token_mint = token['mint']
-    
-    if len(token_mint) > 0:
-        url = f"https://api.helius.xyz/v0/token-metadata?api-key={HELIUS_KEY}"
-        nft_addresses = [token_mint]
-        r_data = {
-            "mintAccounts": nft_addresses,
-            "includeOffChain": True,
-            "disableCache": False,
-        }
+    try:
+        token_mint = ''
+        for token in data[0]['tokenTransfers']:
+            if 'NonFungible' in token['tokenStandard']:
+                token_mint = token['mint']
+        
+        if len(token_mint) > 0:
+            url = f"https://api.helius.xyz/v0/token-metadata?api-key={HELIUS_KEY}"
+            nft_addresses = [token_mint]
+            r_data = {
+                "mintAccounts": nft_addresses,
+                "includeOffChain": True,
+                "disableCache": False,
+            }
 
-        r = requests.post(url=url, json=r_data)
-        j = r.json()
-        if 'metadata' not in j[0]['offChainMetadata']:
+            r = requests.post(url=url, json=r_data, timeout=10)
+            j = r.json()
+            if 'metadata' not in j[0]['offChainMetadata']:
+                return ''
+            if 'image' not in j[0]['offChainMetadata']['metadata']:
+                return ''
+            image = j[0]['offChainMetadata']['metadata']['image']
+            return image
+        else:
+            if 'compressed' in data[0]['events']:
+                if 'assetId' in data[0]['events']['compressed'][0]:
+                    asset_id = data[0]['events']['compressed'][0]['assetId']
+                    try:
+                        image = get_compressed_image(asset_id)
+                        return image
+                    except:
+                        return ''
             return ''
-        if 'image' not in j[0]['offChainMetadata']['metadata']:
-            return ''
-        image = j[0]['offChainMetadata']['metadata']['image']
-        return image
-    else:
-        if 'compressed' in data[0]['events']:
-            if 'assetId' in data[0]['events']['compressed'][0]:
-                asset_id = data[0]['events']['compressed'][0]['assetId']
-                try:
-                    image = get_compressed_image(asset_id)
-                    return image
-                except:
-                    return ''
+    except Exception as e:
+        logger.error(f"Error checking image: {e}")
         return ''
 
 def create_message(data):
-    tx_type = data[0]['type'].replace("_", " ")
-    tx = data[0]['signature']
-    source = data[0]['source']
-    description = data[0]['description']
+    try:
+        tx_type = data[0]['type'].replace("_", " ")
+        tx = data[0]['signature']
+        source = data[0]['source']
+        description = data[0]['description']
 
-    accounts = []
-    for inst in data[0]["instructions"]:
-        accounts = accounts + inst["accounts"]
-    
-    if len(data[0]['tokenTransfers']) > 0:
-        for token in data[0]['tokenTransfers']:
-            accounts.append(token['fromUserAccount'])
-            accounts.append(token['toUserAccount'])
-        accounts = list(set(accounts))
+        accounts = []
+        for inst in data[0]["instructions"]:
+            accounts = accounts + inst["accounts"]
+        
+        if len(data[0]['tokenTransfers']) > 0:
+            for token in data[0]['tokenTransfers']:
+                accounts.append(token['fromUserAccount'])
+                accounts.append(token['toUserAccount'])
+            accounts = list(set(accounts))
 
-    image = check_image(data)
-    
-    found_docs = list(wallets_collection.find(
-        {
-            "address": {"$in": accounts},
-            "status": "active"
-        }
-    ))
-    found_users = [i['user_id'] for i in found_docs]
-    found_users = set(found_users)
-    logging.info(found_users)
-    
-    messages = []
-    for user in found_users:
-        if source != "SYSTEM_PROGRAM":
-            message = f'*{tx_type}* on {source}'
-        else:
-            message = f'*{tx_type}*'
-        if len(description) > 0:
-            message = message + '\n\n' + data[0]['description']
+        image = check_image(data)
+        
+        found_docs = list(wallets_collection.find(
+            {
+                "address": {"$in": accounts},
+                "status": "active"
+            }
+        ))
+        found_users = [i['user_id'] for i in found_docs]
+        found_users = set(found_users)
+        logging.info(f"Found users: {found_users}")
+        
+        messages = []
+        for user in found_users:
+            if source != "SYSTEM_PROGRAM":
+                message = f'*{tx_type}* on {source}'
+            else:
+                message = f'*{tx_type}*'
+            if len(description) > 0:
+                message = message + '\n\n' + data[0]['description']
 
-            user_wallets = [i['address'] for i in found_docs if i['user_id']==user]
-            for user_wallet in user_wallets:
-                if user_wallet not in message:
-                    continue
-                formatted_user_wallet = user_wallet[:4] + '...' + user_wallet[-4:]
-                message = message.replace(user_wallet, f'*YOUR WALLET* ({formatted_user_wallet})')
+                user_wallets = [i['address'] for i in found_docs if i['user_id']==user]
+                for user_wallet in user_wallets:
+                    if user_wallet not in message:
+                        continue
+                    formatted_user_wallet = user_wallet[:4] + '...' + user_wallet[-4:]
+                    message = message.replace(user_wallet, f'*YOUR WALLET* ({formatted_user_wallet})')
 
-        formatted_text = re.sub(r'[A-Za-z0-9]{32,44}', format_wallet_address, message)
-        formatted_text = formatted_text + f'\n[XRAY](https://xray.helius.xyz/tx/{tx}) | [Solscan](https://solscan.io/tx/{tx})'
-        formatted_text = formatted_text.replace("#", "").replace("_", " ")
-        messages.append({'user': user, 'text': formatted_text, 'image': image})
-    return messages
+            formatted_text = re.sub(r'[A-Za-z0-9]{32,44}', format_wallet_address, message)
+            formatted_text = formatted_text + f'\n[XRAY](https://xray.helius.xyz/tx/{tx}) | [Solscan](https://solscan.io/tx/{tx})'
+            formatted_text = formatted_text.replace("#", "").replace("_", " ")
+            messages.append({'user': user, 'text': formatted_text, 'image': image})
+        return messages
+    except Exception as e:
+        logger.error(f"Error creating message: {e}")
+        return []
 
 app = Flask(__name__)
 
+# Health check endpoint
+@app.route('/', methods=['GET'])
+def health_check():
+    return jsonify({"status": "ok"}), 200
+
+@app.route('/webhook-health', methods=['GET'])
+def webhook_health():
+    return jsonify({
+        "status": "ok",
+        "timestamp": datetime.now().isoformat(),
+        "service": "solana-webhook"
+    }), 200
+
 @app.route('/wallet', methods=['POST'])
 def handle_webhook():
-    data = request.json
-    
-    messages = create_message(data)
+    try:
+        if not request.is_json:
+            logger.error("Invalid request: Not JSON")
+            return jsonify({"error": "Invalid request"}), 400
 
-    for message in messages:
-        db_entry = {
-            "user": message['user'],
-            "message": message['text'],
-            "datetime": datetime.now()
-        }
-        db.messages.insert_one(db_entry)
+        data = request.json
+        if not data:
+            logger.error("Invalid request: Empty data")
+            return jsonify({"error": "Empty data"}), 400
+        
+        messages = create_message(data)
 
-        logging.info(message)
-
-        if len(message['image']) > 0:
+        for message in messages:
             try:
-                send_image_to_user(BOT_TOKEN, message['user'], message['text'], message['image'])
-            except Exception as e:
-                logging.info(e)
-                send_message_to_user(BOT_TOKEN, message['user'], message['text'])    
-        else:
-            send_message_to_user(BOT_TOKEN, message['user'], message['text'])
+                db_entry = {
+                    "user": message['user'],
+                    "message": message['text'],
+                    "datetime": datetime.now()
+                }
+                db.messages.insert_one(db_entry)
 
-    logging.info('ok event')
-    return 'OK'
+                if len(message['image']) > 0:
+                    try:
+                        send_image_to_user(BOT_TOKEN, message['user'], message['text'], message['image'])
+                    except Exception as e:
+                        logger.error(f"Error sending image, falling back to text: {e}")
+                        send_message_to_user(BOT_TOKEN, message['user'], message['text'])    
+                else:
+                    send_message_to_user(BOT_TOKEN, message['user'], message['text'])
+            except Exception as e:
+                logger.error(f"Error processing message: {e}")
+
+        logger.info('Webhook processed successfully')
+        return jsonify({"status": "ok"}), 200
+
+    except Exception as e:
+        logger.error(f"Error handling webhook: {e}")
+        return jsonify({"error": "Internal server error"}), 500
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5002))
