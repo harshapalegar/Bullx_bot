@@ -5,8 +5,9 @@ from source.config import UserPlan, PREMIUM_FEATURES, FREE_FEATURES
 logger = logging.getLogger(__name__)
 
 class PremiumManager:
-    def __init__(self, db):
+    def __init__(self, db, db_manager: DatabaseManager):
         self.db = db
+        self.db_manager = db_manager
 
     def is_premium(self, user_id: str) -> bool:
         try:
@@ -14,22 +15,6 @@ class PremiumManager:
             return user and user.get("plan") == UserPlan.PREMIUM
         except Exception as e:
             logger.error(f"Error checking premium status: {e}")
-            return False
-
-    def upgrade_to_premium(self, user_id: str) -> bool:
-        try:
-            result = self.db.users.update_one(
-                {"user_id": str(user_id)},
-                {
-                    "$set": {
-                        "plan": UserPlan.PREMIUM,
-                        "premium_since": datetime.now()
-                    }
-                }
-            )
-            return result.modified_count > 0
-        except Exception as e:
-            logger.error(f"Error upgrading to premium: {e}")
             return False
 
     def get_user_features(self, user_id: str) -> dict:
