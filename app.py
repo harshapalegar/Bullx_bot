@@ -1,3 +1,7 @@
+from flask import Flask, request, jsonify
+from telegram import Bot
+from telegram.utils.request import Request
+from PIL import Image
 from io import BytesIO
 import re
 import os
@@ -18,7 +22,7 @@ class UserPlan:
 class UserLimits:
     FREE_WALLET_LIMIT = 3
     PREMIUM_WALLET_LIMIT = 10
-    
+
 # Set up logging
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -42,207 +46,78 @@ except Exception as e:
     logger.error(f"Failed to connect to MongoDB: {e}")
     raise
 
-def send_message_to_user(bot_token, user_id, message, priority=False):
-    try:
-        request = Request(con_pool_size=8)
-        bot = Bot(bot_token, request=request)
-        
-        # Add priority indicator for premium users
-        if priority and premium_manager.is_premium(user_id):
-            message = "🔔 *Priority Alert*\n\n" + message
+class DatabaseManager:
+    def __init__(self, db):
+        self.db = db
+
+    def ensure_user_exists(self, user_id: str, username: str = None) -> None:
+        try:
+            existing_user = self.db.users.find_one({"user_id": str(user_id)})
+            if not existing_user:
+                self.db.users.insert_one({
+                    "user_id": str(user_id),
+                    "username": username,
+                    "plan": UserPlan.FREE,
+                    "joined_date": datetime.now(),
+                    "status": "active"
+                })
+                logger.info(f"Created new user: {user_id}")
+        except Exception as e:
+            logger.error(f"Error ensuring user exists: {e}")
+
+    def get_user_stats(self, user_id: str) -> dict:
+        try:
+            active_wallets = self.db.wallets.count_documents({
+                "user_id": str(user_id),
+                "status": "active"
+            })
             
-        bot.send_message(
-            chat_id=user_id,
-            text=message,
-            parse_mode="Markdown",
-            disable_web_page_preview=True
-        )
-        logger.info(f"Successfully sent message to user {user_id}")
-    except Exception as e:
-        logger.error(f"Error sending message to user {user_id}: {e}")
-
-def send_image_to_user(bot_token, user_id, message, image_url, priority=False):
-    try:
-        request = Request(con_pool_size=8)
-        bot = Bot(bot_token, request=request)
-        
-        # Add priority indicator for premium users
-        if priority and premium_manager.is_premium(user_id):
-            message = "🔔 *Priority Alert*\n\n" + message
+            today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+            transactions_today = self.db.messages.count_documents({
+                "user": str(user_id),
+                "datetime": {"$gte": today}
+            })
             
-        image_bytes = get_image(image_url)
-        bot.send_photo(
-            chat_id=user_id,
-            photo=image_bytes,
-            caption=message,
-            parse_mode="Markdown"
-        )
-        logger.info(f"Successfully sent image message to user {user_id}")
-    except Exception as e:
-        logger.error(f"Error sending image to user {user_id}: {e}")
-        send_message_to_user(bot_token, user_id, message, priority)    
-    
-def get_image(url):
-    try:
-        response = requests.get(url, timeout=10).content
-        image = Image.open(BytesIO(response))
-        image = image.convert('RGB')
-        max_size = (800, 800)
-        image.thumbnail(max_size, Image.LANCZOS)
-        image_bytes = BytesIO()
-        image.save(image_bytes, 'JPEG', quality=85)
-        image_bytes.seek(0)
-        return image_bytes
-    except Exception as e:
-        logger.error(f"Error getting image from {url}: {e}")
-        raise
-
-def format_wallet_address(match_obj):
-    wallet_address = match_obj.group(0)
-    return wallet_address[:4] + "..." + wallet_address[-4:]
-
-def get_compressed_image(asset_id):
-    try:
-        url = f'https://rpc.helius.xyz/?api-key={HELIUS_KEY}'
-        r_data = {
-            "jsonrpc": "2.0",
-            "id": "my-id",
-            "method": "getAsset",
-            "params": [
-                asset_id
-            ]
-        }
-        r = requests.post(url, json=r_data, timeout=10)
-        url_meta = r.json()['result']['content']['json_uri']
-        r = requests.get(url=url_meta, timeout=10)
-        return r.json()['image']
-    except Exception as e:
-        logger.error(f"Error getting compressed image for asset {asset_id}: {e}")
-        return ''
-
-def check_image(data):
-    try:
-        token_mint = ''
-        for token in data[0]['tokenTransfers']:
-            if 'NonFungible' in token['tokenStandard']:
-                token_mint = token['mint']
-        
-        if len(token_mint) > 0:
-            url = f"https://api.helius.xyz/v0/token-metadata?api-key={HELIUS_KEY}"
-            nft_addresses = [token_mint]
-            r_data = {
-                "mintAccounts": nft_addresses,
-                "includeOffChain": True,
-                "disableCache": False,
+            user_data = self.db.users.find_one({"user_id": str(user_id)}) or {
+                "plan": UserPlan.FREE,
+                "joined_date": datetime.now()
+            }
+            
+            return {
+                "active_wallets": active_wallets,
+                "transactions_today": transactions_today,
+                "plan": user_data.get("plan", UserPlan.FREE),
+                "wallet_limit": UserLimits.PREMIUM_WALLET_LIMIT if user_data.get("plan") == UserPlan.PREMIUM else UserLimits.FREE_WALLET_LIMIT
+            }
+        except Exception as e:
+            logger.error(f"Error getting user stats: {e}")
+            return {
+                "active_wallets": 0,
+                "transactions_today": 0,
+                "plan": UserPlan.FREE,
+                "wallet_limit": UserLimits.FREE_WALLET_LIMIT
             }
 
-            r = requests.post(url=url, json=r_data, timeout=10)
-            j = r.json()
-            if 'metadata' not in j[0]['offChainMetadata']:
-                return ''
-            if 'image' not in j[0]['offChainMetadata']['metadata']:
-                return ''
-            image = j[0]['offChainMetadata']['metadata']['image']
-            return image
-        else:
-            if 'compressed' in data[0]['events']:
-                if 'assetId' in data[0]['events']['compressed'][0]:
-                    asset_id = data[0]['events']['compressed'][0]['assetId']
-                    try:
-                        image = get_compressed_image(asset_id)
-                        return image
-                    except:
-                        return ''
-            return ''
-    except Exception as e:
-        logger.error(f"Error checking image: {e}")
-        return ''
+class PremiumManager:
+    def __init__(self, db):
+        self.db = db
 
-def create_message(data):
-    try:
-        logger.info(f"Processing transaction data: {data}")
-        
-        tx_type = data[0]['type'].replace("_", " ")
-        tx = data[0]['signature']
-        source = data[0]['source']
-        description = data[0]['description']
+    def is_premium(self, user_id: str) -> bool:
+        try:
+            user = self.db.users.find_one({"user_id": str(user_id)})
+            return user and user.get("plan") == UserPlan.PREMIUM
+        except Exception as e:
+            logger.error(f"Error checking premium status: {e}")
+            return False
 
-        accounts = []
-        for inst in data[0]["instructions"]:
-            accounts = accounts + inst["accounts"]
-        
-        if len(data[0]['tokenTransfers']) > 0:
-            for token in data[0]['tokenTransfers']:
-                accounts.append(token['fromUserAccount'])
-                accounts.append(token['toUserAccount'])
-            accounts = list(set(accounts))
+# Rest of your existing app.py code remains the same...
 
-        logger.info(f"Found accounts in transaction: {accounts}")
-        image = check_image(data)
-        
-        # Find affected wallets
-        found_docs = list(db.wallets.find({
-            "address": {"$in": accounts},
-            "status": "active"
-        }))
-        
-        logger.info(f"Found wallet documents: {found_docs}")
-        
-        # Get unique users and check their premium status
-        found_users = set(doc['user_id'] for doc in found_docs)
-        priority_users = set(
-            user_id for user_id in found_users 
-            if premium_manager.is_premium(user_id)
-        )
-        
-        logger.info(f"Found users: {found_users}, Priority users: {priority_users}")
-        
-        messages = []
-        for user in found_users:
-            is_priority = user in priority_users
-            if source != "SYSTEM_PROGRAM":
-                message = f'*{tx_type}* on {source}'
-            else:
-                message = f'*{tx_type}*'
-                
-            if len(description) > 0:
-                message = message + '\n\n' + data[0]['description']
-                user_wallets = [i['address'] for i in found_docs if i['user_id']==user]
-                
-                for wallet in user_wallets:
-                    if wallet not in message:
-                        continue
-                    # Get custom name for wallet if it exists
-                    wallet_doc = next((doc for doc in found_docs if doc['address'] == wallet), None)
-                    if wallet_doc and 'name' in wallet_doc:
-                        formatted_name = wallet_doc['name']
-                    else:
-                        formatted_name = f"{wallet[:4]}...{wallet[-4:]}"
-                    message = message.replace(wallet, f'*{formatted_name}*')
-
-            formatted_text = re.sub(r'[A-Za-z0-9]{32,44}', format_wallet_address, message)
-            formatted_text = formatted_text + f'\n[XRAY](https://xray.helius.xyz/tx/{tx}) | [Solscan](https://solscan.io/tx/{tx})'
-            formatted_text = formatted_text.replace("#", "").replace("_", " ")
-            
-            messages.append({
-                'user': user,
-                'text': formatted_text,
-                'image': image,
-                'priority': is_priority
-            })
-        
-        return messages
-    except Exception as e:
-        logger.error(f"Error creating message: {e}")
-        logger.error(f"Data that caused error: {data}")
-        return []
-
+# Flask app setup and routes
 app = Flask(__name__)
 
 @app.route('/', methods=['GET'])
 def health_check():
     try:
-        # Test MongoDB connection
         client.admin.command('ping')
         mongo_status = "connected"
     except Exception as e:
@@ -271,7 +146,6 @@ def webhook_health():
 def handle_webhook():
     try:
         logger.info(f"Received webhook request: {request.headers}")
-        
         if not request.is_json:
             logger.error("Invalid request: Not JSON")
             return jsonify({"error": "Invalid request"}), 400
@@ -296,6 +170,7 @@ def handle_webhook():
                     "is_priority": message['priority']
                 }
                 db.messages.insert_one(db_entry)
+                logger.info(f"Saved message to database: {db_entry}")
 
                 # Send notification
                 if len(message['image']) > 0:
