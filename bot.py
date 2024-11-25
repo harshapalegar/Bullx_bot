@@ -44,8 +44,17 @@ BOT_TOKEN = os.environ.get('BOT_TOKEN')
 TOKEN = BOT_TOKEN
 HELIUS_KEY = os.environ.get('HELIUS_KEY')
 HELIUS_WEBHOOK_ID = os.environ.get('HELIUS_WEBHOOK_ID')
+WEBHOOK_URL = os.environ.get('WEBHOOK_URL')
 
 ADDING_WALLET, DELETING_WALLET = range(2)
+
+# Set up logging first
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO,
+    handlers=[logging.StreamHandler()]
+)
+logger = logging.getLogger(__name__)
 
 try:
     client = MongoClient(MONGODB_URI, serverSelectionTimeoutMS=5000)
@@ -58,19 +67,10 @@ except Exception as e:
     logger.error(f"Failed to connect to MongoDB: {e}")
     raise
 
-# Set up logging
-logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO,
-    handlers=[logging.StreamHandler()]
-)
-logger = logging.getLogger(__name__)
-
 # Start health check server in a separate thread
 health_check_thread = threading.Thread(target=run_health_check_server, daemon=True)
 health_check_thread.start()
 
-# Utility functions
 def is_solana_wallet_address(address):
     if not address:
         return False
@@ -152,15 +152,14 @@ def add_webhook(user_id, address, webhook_id, existing_addresses):
             
         url = f"https://api.helius.xyz/v0/webhooks/{webhook_id}?api-key={HELIUS_KEY}"
         
-        webhook_url = os.environ.get('WEBHOOK_URL')
-        if not webhook_url:
+        if not WEBHOOK_URL:
             logger.error("WEBHOOK_URL environment variable not set")
             return False
 
         new_addresses = existing_addresses + [address]
         data = {
             "accountAddresses": new_addresses,
-            "webhookURL": webhook_url
+            "webhookURL": WEBHOOK_URL
         }
         
         response = requests.put(url, json=data, timeout=10)
@@ -182,15 +181,14 @@ def delete_webhook(user_id, address, webhook_id, existing_addresses):
             
         url = f"https://api.helius.xyz/v0/webhooks/{webhook_id}?api-key={HELIUS_KEY}"
         
-        webhook_url = os.environ.get('WEBHOOK_URL')
-        if not webhook_url:
+        if not WEBHOOK_URL:
             logger.error("WEBHOOK_URL environment variable not set")
             return False
 
         new_addresses = [addr for addr in existing_addresses if addr != address]
         data = {
             "accountAddresses": new_addresses,
-            "webhookURL": webhook_url
+            "webhookURL": WEBHOOK_URL
         }
         
         response = requests.put(url, json=data, timeout=10)
@@ -205,12 +203,10 @@ def delete_webhook(user_id, address, webhook_id, existing_addresses):
         logger.error(f"Error deleting webhook: {e}")
         return False
 
-# Message handlers
 def error_handler(update: Update, context: CallbackContext) -> None:
     logger.error(f"Update {update} caused error {context.error}")
     try:
         if isinstance(context.error, (BadRequest, Unauthorized)):
-            # Handle Telegram API errors
             return
         if update.message:
             update.message.reply_text(
@@ -286,10 +282,234 @@ def back_button(update: Update, context: CallbackContext) -> None:
         logger.error(f"Error in back_button: {e}")
         return None
 
-[... Rest of the handlers remain the same as in previous bot.py with added error handling ...]
+def button_callback(update: Update, context: CallbackContext) -> None:
+    try:
+        query = update.callback_query
+        query.answer()
+
+        if query.data == "addWallet":
+            return add_wallet_start(update, context)
+        elif query.data == "deleteWallet":
+            return delete_wallet_start(update, context)
+        elif query.data == "showWallets":
+            return show_wallets(update, context)
+        elif query.data == "back":
+            return back(update, context)
+    except Exception as e:
+        logger.error(f"Error in button_callback: {e}")
+        return ConversationHandler.END
+
+def back(update: Update, context: CallbackContext) -> int:
+    try:
+        query = update.callback_query
+        query.answer()
+        query.edit_message_text("No worries! Let's head back to the main menu for more fun! 🎉")
+        start(update, context)
+        return ConversationHandler.END
+    except Exception as e:
+        logger.error(f"Error in back: {e}")
+        return ConversationHandler.END
+
+def add_wallet_start(update: Update, context: CallbackContext) -> int:
+    try:
+        reply_markup = back_button(update, context)
+        query = update.callback_query
+        query.answer()
+        query.edit_message_text(
+            "Alright, ready to expand your wallet empire? Send me the wallet address you'd like to add! 🎩",
+            reply_markup=reply_markup
+        )
+        return ADDING_WALLET
+    except Exception as e:
+        logger.error(f"Error in add_wallet_start: {e}")
+        return ConversationHandler.END
+
+def add_wallet_finish(update: Update, context: CallbackContext) -> int:
+    try:
+        reply_markup = back_button(update, context)
+        wallet_address = update.message.text
+        user_id = update.effective_user.id
+
+        if not wallet_address:
+            update.message.reply_text(
+                "Oops! Looks like you forgot the wallet address. Send it over so we can get things rolling! 📨",
+                reply_markup=reply_markup
+            )
+            return ADDING_WALLET
+
+        if not is_solana_wallet_address(wallet_address):
+            update.message.reply_text(
+                "Uh-oh! That Solana wallet address seems a bit fishy. Double-check it and send a valid one, please! 🕵️‍♂️",
+                reply_markup=reply_markup
+            )
+            return ADDING_WALLET
+        
+        check_res, check_num_tx = check_wallet_transactions(wallet_address)
+        if not check_res:
+            update.message.reply_text(
+                f"Whoa, slow down Speedy Gonzales! 🏎️ We can only handle wallets with under 50 transactions per day. Your wallet's at {round(check_num_tx, 1)}. Let's pick another, shall we? 😉",
+                reply_markup=reply_markup
+            )
+            return ADDING_WALLET
+
+        if wallet_count_for_user(user_id) >= 5:
+            update.message.reply_text(
+                "Oops! You've reached the wallet limit! It seems you're quite the collector, but we can only handle up to 5 wallets per user. Time to make some tough choices! 😄",
+                reply_markup=reply_markup
+            )
+            return ADDING_WALLET
+
+        existing_wallet = wallets_collection.find_one(
+            {
+                "user_id": str(user_id),
+                "address": wallet_address,
+                "status": "active"
+            })
+
+        if existing_wallet:
+            update.message.reply_text(
+                "Hey there, déjà vu! You've already added this wallet. Time for a different action, perhaps? 🔄",
+                reply_markup=reply_markup
+            )
+        else:
+            reply_markup = next(update, context)
+            success, webhook_id, addresses = get_webhook(HELIUS_WEBHOOK_ID)
+            r_success = add_webhook(user_id, wallet_address, webhook_id, addresses)
+            
+            if (success) and (r_success):
+                main = {
+                    "user_id": str(user_id),
+                    "address": wallet_address,
+                    "datetime": datetime.now(),
+                    "status": 'active',
+                }
+                wallets_collection.insert_one(main)
+                    
+                update.message.reply_text(
+                    "Huzzah! Your wallet has been added with a flourish! 🎉 Now you can sit back, relax, and enjoy your Solana experience as I keep an eye on your transactions. What's your next grand plan?",
+                    reply_markup=reply_markup
+                )
+            else:
+                update.message.reply_text(
+                    "Bummer! We hit a snag while saving your wallet. Let's give it another whirl, shall we? 🔄",
+                    reply_markup=reply_markup
+                )
+
+        return ConversationHandler.END
+    except Exception as e:
+        logger.error(f"Error in add_wallet_finish: {e}")
+        return ConversationHandler.END
+
+def delete_wallet_start(update: Update, context: CallbackContext) -> int:
+    try:
+        reply_markup = back_button(update, context)
+        query = update.callback_query
+        query.answer()
+        query.edit_message_text(
+            "Time for some spring cleaning? Send the wallet address you'd like to sweep away! 🧹",
+            reply_markup=reply_markup
+        )
+        return DELETING_WALLET
+    except Exception as e:
+        logger.error(f"Error in delete_wallet_start: {e}")
+        return ConversationHandler.END
+
+def delete_wallet_finish(update: Update, context: CallbackContext) -> int:
+    try:
+        reply_markup = next(update, context)
+        wallet_address = update.message.text
+        user_id = update.effective_user.id
+
+        if not is_solana_wallet_address(wallet_address):
+            update.message.reply_text(
+                "Hmm, that doesn't look like a valid Solana address. Want to try again? 🤔",
+                reply_markup=back_button(update, context)
+            )
+            return DELETING_WALLET
+
+        wallets_exist = wallets_collection.find(
+            {
+                "address": wallet_address,
+                "status": "active"
+            })
+        r_success = True
+        if len(list(wallets_exist)) == 1:
+            logging.info('deleting unique address')
+            success, webhook_id, addresses = get_webhook(HELIUS_WEBHOOK_ID)
+            r_success = delete_webhook(user_id, wallet_address, webhook_id, addresses)
+        else:
+            logging.info('address not unique, not deleting')
+
+        reply_markup = back_button(update, context)
+        if r_success:
+            result = wallets_collection.delete_one({
+                "user_id": str(user_id), 
+                "address": wallet_address,
+                "status": "active"
+            })
+            if result.deleted_count == 0:
+                update.message.reply_text(
+                    "Hmm, that wallet's either missing or not yours. Let's try something else, okay? 🕵️‍♀️",
+                    reply_markup=reply_markup
+                )
+            else:
+                update.message.reply_text(
+                    "Poof! Your wallet has vanished into thin air! Now, what other adventures await? ✨",
+                    reply_markup=reply_markup
+                )
+        else:
+            update.message.reply_text(
+                "Yikes, we couldn't delete the wallet. Don't worry, we'll get it next time! Try again, please. 🔄",
+                reply_markup=reply_markup
+            )
+
+        return ConversationHandler.END
+    except Exception as e:
+        logger.error(f"Error in delete_wallet_finish: {e}")
+        return ConversationHandler.END
+
+def show_wallets(update: Update, context: CallbackContext) -> None:
+    try:
+        reply_markup = next(update, context)
+        user_id = update.effective_user.id
+
+        user_wallets = list(wallets_collection.find(
+            {
+                "user_id": str(user_id),
+                "status": "active"
+            }))
+        
+        if len(user_wallets) == 0:
+            update.callback_query.answer()
+            update.callback_query.edit_message_text(
+                "Whoa, no wallets here! Let's add some, or pick another action to make things exciting! 🎢",
+                reply_markup=reply_markup
+            )
+        else:
+            wallet_list = "\n".join([wallet["address"] for wallet in user_wallets])
+            update.callback_query.answer()
+            update.callback_query.edit_message_text(
+                f"Feast your eyes upon your wallet collection! 🎩\n\n{wallet_list}\n\nNow, what's your next move, my friend? 🤔",
+                reply_markup=reply_markup
+            )
+    except Exception as e:
+        logger.error(f"Error in show_wallets: {e}")
+        try:
+            update.callback_query.edit_message_text(
+                "Sorry, something went wrong while fetching your wallets. Please try again! 🔄",
+                reply_markup=next(update, context)
+            )
+        except:
+            pass
 
 def main() -> None:
     try:
+        # Verify all required environment variables are set
+        required_vars = ['MONGODB_URI', 'BOT_TOKEN', 'HELIUS_KEY', 'HELIUS_WEBHOOK_ID', 'WEBHOOK_URL']
+        missing_vars = [var for var in required_vars if not os.environ.get(var)]
+        if missing_vars:
+            raise EnvironmentError(f"Missing required environment variables: {', '.join(missing_vars)}")
+
         # Initialize bot
         updater = Updater(TOKEN)
         dispatcher = updater.dispatcher
