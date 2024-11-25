@@ -4,14 +4,21 @@ import requests
 import base58
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
-from telegram import Update, ForceReply, Bot, ParseMode
-from telegram.ext import Updater, CommandHandler, MessageHandler, Filters, CallbackContext
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import CallbackQueryHandler
-from telegram.ext import ConversationHandler
+from telegram import (
+    Update, ForceReply, Bot, ParseMode, ReplyKeyboardRemove, 
+    CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup
+)
+from telegram.ext import (
+    Updater, CommandHandler, MessageHandler, Filters, CallbackContext,
+    CallbackQueryHandler, ConversationHandler
+)
+from telegram.error import BadRequest, Unauthorized, TimedOut
 from pymongo import MongoClient
 from datetime import datetime, timedelta
-from telegram.error import BadRequest, Unauthorized, TimedOut
+from dotenv import load_dotenv
+
+# Load environment variables
+load_dotenv()
 
 # Environment variables
 BOT_TOKEN = os.environ.get('BOT_TOKEN')
@@ -31,6 +38,38 @@ class UserPlan:
 class UserLimits:
     FREE_WALLET_LIMIT = 3
     PREMIUM_WALLET_LIMIT = 10
+
+# Set up logging first
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO,
+    handlers=[logging.StreamHandler()]
+)
+logger = logging.getLogger(__name__)
+
+# Health check handler
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header('Content-type', 'text/plain')
+        self.end_headers()
+        self.wfile.write(b"OK")
+        
+    def log_message(self, format, *args):
+        pass
+
+def run_health_check_server():
+    try:
+        server_address = ('', 8000)
+        httpd = HTTPServer(server_address, HealthCheckHandler)
+        logger.info("Health check server started on port 8000")
+        httpd.serve_forever()
+    except Exception as e:
+        logger.error(f"Error in health check server: {e}")
+
+# Start health check server
+health_check_thread = threading.Thread(target=run_health_check_server, daemon=True)
+health_check_thread.start()
 
 # Database Manager Class
 class DatabaseManager:
@@ -193,7 +232,23 @@ class AdminSystem:
                 "transactions_today": 0
             }
 
-# Helius API functions
+# Initialize MongoDB and managers
+try:
+    client = MongoClient(MONGODB_URI, serverSelectionTimeoutMS=5000)
+    client.admin.command('ping')
+    db = client.sol_wallets
+    logger.info("Successfully connected to MongoDB")
+    
+    # Initialize managers
+    db_manager = DatabaseManager(db)
+    premium_manager = PremiumManager(db)
+    admin_system = AdminSystem(db)
+    
+except Exception as e:
+    logger.error(f"Failed to connect to MongoDB: {e}")
+    raise
+
+# Utility functions
 def is_solana_wallet_address(address: str) -> bool:
     try:
         decoded = base58.b58decode(address)
@@ -231,7 +286,7 @@ def add_webhook(user_id: str, address: str, webhook_id: str, existing_addresses:
         
         webhook_url = os.environ.get('WEBHOOK_URL')
         if not webhook_url:
-            logger.warning("WEBHOOK_URL not set, continuing anyway")
+            logger.warning("WEBHOOK_URL not set")
             return True
 
         new_addresses = existing_addresses + [address]
@@ -246,54 +301,6 @@ def add_webhook(user_id: str, address: str, webhook_id: str, existing_addresses:
     except Exception as e:
         logger.error(f"Error adding webhook for address {address}: {e}")
         return True
-
-# Health check server
-class HealthCheckHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.send_header('Content-type', 'text/plain')
-        self.end_headers()
-        self.wfile.write(b"OK")
-        
-    def log_message(self, format, *args):
-        pass
-
-def run_health_check_server():
-    try:
-        server_address = ('', 8000)
-        httpd = HTTPServer(server_address, HealthCheckHandler)
-        logger.info("Health check server started on port 8000")
-        httpd.serve_forever()
-    except Exception as e:
-        logger.error(f"Error in health check server: {e}")
-
-# Set up logging
-logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO,
-    handlers=[logging.StreamHandler()]
-)
-logger = logging.getLogger(__name__)
-
-# Start health check server
-health_check_thread = threading.Thread(target=run_health_check_server, daemon=True)
-health_check_thread.start()
-
-# Initialize MongoDB and managers
-try:
-    client = MongoClient(MONGODB_URI, serverSelectionTimeoutMS=5000)
-    client.admin.command('ping')
-    db = client.sol_wallets
-    logger.info("Successfully connected to MongoDB")
-    
-    # Initialize managers
-    db_manager = DatabaseManager(db)
-    premium_manager = PremiumManager(db)
-    admin_system = AdminSystem(db)
-    
-except Exception as e:
-    logger.error(f"Failed to connect to MongoDB: {e}")
-    raise
 
 # Command Handlers
 def error_handler(update: Update, context: CallbackContext) -> None:
@@ -371,127 +378,38 @@ def cancel(update: Update, context: CallbackContext) -> int:
     )
     return ConversationHandler.END
 
-def add_wallet_start(update: Update, context: CallbackContext) -> int:
+def handle_delete_callback(update: Update, context: CallbackContext) -> int:
     try:
+        query = update.callback_query
         user_id = str(update.effective_user.id)
+        logger.info(f"Processing delete callback for user {user_id}")
         
-        # Check wallet limit
-        stats = db_manager.get_user_stats(user_id)
-        if stats['active_wallets'] >= stats['wallet_limit']:
-            message = (
-                f"❗️ You've reached the {stats['plan']} plan wallet limit!\n\n"
-                f"Current limit: {stats['wallet_limit']} wallets\n"
-            )
-            if stats['plan'] == UserPlan.FREE:
-                message += "\nUpgrade to Premium for more wallets! Use /premium"
-                
-            if isinstance(update.callback_query, CallbackQuery):
-                update.callback_query.answer()
-                update.callback_query.edit_message_text(message)
-            else:
-                update.message.reply_text(message)
+        if query.data == "start":
+            start(update, context)
             return ConversationHandler.END
-
-        message = (
-            "Please send me the Solana wallet address you want to add 🏦\n"
-            "Or send /cancel to cancel"
-        )
-        
-        if isinstance(update.callback_query, CallbackQuery):
-            update.callback_query.answer()
-            update.callback_query.edit_message_text(message)
-        else:
-            update.message.reply_text(message)
             
-        return ADDING_WALLET
+        wallet_name = query.data.replace("delete_", "")
+        logger.info(f"Attempting to delete wallet {wallet_name}")
         
-    except Exception as e:
-        logger.error(f"Error in add_wallet_start: {e}")
-        return ConversationHandler.END
-
-def handle_wallet_address(update: Update, context: CallbackContext) -> int:
-    try:
-        user_id = str(update.effective_user.id)
-        wallet_address = update.message.text.strip()
-
-        if not is_solana_wallet_address(wallet_address):
-            update.message.reply_text(
-                "That doesn't look like a valid Solana address. Please try again! 🤔\n"
-                "Or send /cancel to cancel"
-            )
-            return ADDING_WALLET
-
-        # Store address temporarily
-        context.user_data['temp_wallet'] = wallet_address
+        success = db_manager.delete_wallet(user_id, wallet_name)
         
-        # For free users, use address as name
-        if not premium_manager.is_premium(user_id):
-            context.user_data['temp_name'] = f"Wallet {wallet_address[:4]}...{wallet_address[-4:]}"
-            return handle_wallet_name(update, context)
-            
-        update.message.reply_text(
-            "Great! Now please send me a name for this wallet (e.g., 'Trading' or 'NFT Wallet') 📝\n"
-            "Or send /cancel to cancel"
-        )
-        return ADDING_NAME
-        
-    except Exception as e:
-        logger.error(f"Error handling wallet address: {e}")
-        update.message.reply_text("Sorry, something went wrong. Please try again!")
-        return ConversationHandler.END
-
-def handle_wallet_name(update: Update, context: CallbackContext) -> int:
-    try:
-        user_id = str(update.effective_user.id)
-        
-        # Get wallet name (either from message or from context for free users)
-        if premium_manager.is_premium(user_id):
-            wallet_name = update.message.text.strip()
-            if len(wallet_name) > 32:
-                update.message.reply_text(
-                    "Wallet name is too long! Please use max 32 characters.\n"
-                    "Try again or send /cancel to cancel"
-                )
-                return ADDING_NAME
+        if success:
+            message = f"Successfully deleted wallet '*{wallet_name}*'! 🗑️"
+            logger.info(f"Successfully deleted wallet {wallet_name}")
         else:
-            wallet_name = context.user_data.get('temp_name')
-
-        wallet_address = context.user_data.get('temp_wallet')
-        if not wallet_address:
-            update.message.reply_text("Something went wrong. Please start over with /add")
-            return ConversationHandler.END
-
-        # Add wallet
-        success = db_manager.add_wallet(user_id, wallet_address, wallet_name)
-        if not success:
-            update.message.reply_text(
-                "This wallet is already in your list! Try another one 🔄"
-            )
-            return ConversationHandler.END
-
-        # Update Helius webhook
-        try:
-            success, webhook_id, addresses = get_webhook(HELIUS_WEBHOOK_ID)
-            add_webhook(user_id, wallet_address, webhook_id, addresses)
-        except Exception as e:
-            logger.error(f"Error updating webhook: {e}")
-
-        message = (
-            f"✅ Successfully added wallet!\n\n"
-            f"*Name:* {wallet_name}\n"
-            f"*Address:* `{wallet_address[:4]}...{wallet_address[-4:]}`\n\n"
-        )
-        
+            message = "Couldn't find that wallet. It might have been already deleted! 🤔"
+            logger.warning(f"Failed to delete wallet {wallet_name}")
+            
         keyboard = [
             [
-                InlineKeyboardButton("➕ Add Another", callback_data="add_wallet"),
-                InlineKeyboardButton("👀 Show All", callback_data="show_wallets")
-            ],
-            [InlineKeyboardButton("🔙 Main Menu", callback_data="start")]
+                InlineKeyboardButton("👀 Show Wallets", callback_data="show_wallets"),
+                InlineKeyboardButton("🔙 Main Menu", callback_data="start")
+            ]
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
         
-        update.message.reply_text(
+        query.answer()
+        query.edit_message_text(
             message,
             reply_markup=reply_markup,
             parse_mode=ParseMode.MARKDOWN
@@ -499,8 +417,16 @@ def handle_wallet_name(update: Update, context: CallbackContext) -> int:
         return ConversationHandler.END
         
     except Exception as e:
-        logger.error(f"Error handling wallet name: {e}")
-        update.message.reply_text("Sorry, something went wrong. Please try again!")
+        logger.error(f"Error handling delete callback: {e}")
+        try:
+            query.edit_message_text(
+                "Sorry, something went wrong. Please try again! 🔧",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("🔙 Main Menu", callback_data="start")
+                ]])
+            )
+        except Exception as inner_e:
+            logger.error(f"Error sending error message: {inner_e}")
         return ConversationHandler.END
 
 def show_wallets(update: Update, context: CallbackContext) -> None:
@@ -612,110 +538,130 @@ def delete_wallet_start(update: Update, context: CallbackContext) -> int:
         logger.error(f"Error in delete_wallet_start: {e}")
         return ConversationHandler.END
 
-def stats_command(update: Update, context: CallbackContext) -> None:
+def add_wallet_start(update: Update, context: CallbackContext) -> int:
     try:
         user_id = str(update.effective_user.id)
         stats = db_manager.get_user_stats(user_id)
         
-        if admin_system.is_admin(user_id):
-            system_stats = admin_system.get_system_stats()
+        if stats['active_wallets'] >= stats['wallet_limit']:
             message = (
-                "*📊 Admin Statistics*\n\n"
-                f"Total Users: `{system_stats['total_users']}`\n"
-                f"Total Wallets: `{system_stats['total_wallets']}`\n"
-                f"Premium Users: `{system_stats['premium_users']}`\n"
-                f"Active Today: `{system_stats['active_today']}`\n\n"
-                "*Your Statistics:*\n"
-                f"Active Wallets: `{stats['active_wallets']}/{stats['wallet_limit']}`\n"
-                f"Transactions Today: `{stats['transactions_today']}`\n"
-                f"Plan: `{stats['plan'].title()}`"
-            )
-        else:
-            message = (
-                "*📊 Your Statistics*\n\n"
-                f"Active Wallets: `{stats['active_wallets']}/{stats['wallet_limit']}`\n"
-                f"Transactions Today: `{stats['transactions_today']}`\n"
-                f"Plan: `{stats['plan'].title()}`\n\n"
+                f"❗️ You've reached the {stats['plan']} plan wallet limit!\n\n"
+                f"Current limit: {stats['wallet_limit']} wallets\n"
             )
             if stats['plan'] == UserPlan.FREE:
-                message += (
-                    "*Want more features? Get Premium!*\n"
-                    f"• Increase limit to {UserLimits.PREMIUM_WALLET_LIMIT} wallets\n"
-                    "• Custom wallet names\n"
-                    "• Priority notifications\n"
-                    "Use /premium to learn more!"
-                )
-
-        keyboard = [[InlineKeyboardButton("🔙 Main Menu", callback_data="start")]]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-
+                message += "\nUpgrade to Premium for more wallets! Use /premium"
+                
+            if isinstance(update.callback_query, CallbackQuery):
+                update.callback_query.answer()
+                update.callback_query.edit_message_text(message)
+            else:
+                update.message.reply_text(message)
+            return ConversationHandler.END
+            
+        message = (
+            "Please send me the Solana wallet address you want to add 🏦\n"
+            "Or send /cancel to cancel"
+        )
+        
         if isinstance(update.callback_query, CallbackQuery):
             update.callback_query.answer()
-            update.callback_query.edit_message_text(
-                message,
-                reply_markup=reply_markup,
-                parse_mode=ParseMode.MARKDOWN
-            )
+            update.callback_query.edit_message_text(message)
         else:
-            update.message.reply_text(
-                message,
-                reply_markup=reply_markup,
-                parse_mode=ParseMode.MARKDOWN
-            )
-
+            update.message.reply_text(message)
+            
+        return ADDING_WALLET
+        
     except Exception as e:
-        logger.error(f"Error in stats command: {e}")
-        update.message.reply_text("Sorry, something went wrong!")
+        logger.error(f"Error in add_wallet_start: {e}")
+        return ConversationHandler.END
 
-def premium_command(update: Update, context: CallbackContext) -> None:
+def handle_wallet_address(update: Update, context: CallbackContext) -> int:
+    try:
+        wallet_address = update.message.text.strip()
+        
+        if not is_solana_wallet_address(wallet_address):
+            update.message.reply_text(
+                "That doesn't look like a valid Solana address. Please try again! 🤔\n"
+                "Or send /cancel to cancel"
+            )
+            return ADDING_WALLET
+            
+        context.user_data['temp_wallet'] = wallet_address
+        
+        if not premium_manager.is_premium(str(update.effective_user.id)):
+            context.user_data['temp_name'] = f"Wallet {wallet_address[:4]}...{wallet_address[-4:]}"
+            return handle_wallet_name(update, context)
+            
+        update.message.reply_text(
+            "Great! Now please send me a name for this wallet (e.g., 'Trading' or 'NFT Wallet') 📝\n"
+            "Or send /cancel to cancel"
+        )
+        return ADDING_NAME
+        
+    except Exception as e:
+        logger.error(f"Error handling wallet address: {e}")
+        update.message.reply_text("Sorry, something went wrong. Please try again!")
+        return ConversationHandler.END
+
+def handle_wallet_name(update: Update, context: CallbackContext) -> int:
     try:
         user_id = str(update.effective_user.id)
-        is_premium = premium_manager.is_premium(user_id)
         
-        if is_premium:
-            message = (
-                "*⭐️ Premium Status*\n\n"
-                "You are a Premium user!\n\n"
-                "*Your Benefits:*\n"
-                f"• Up to {UserLimits.PREMIUM_WALLET_LIMIT} wallets\n"
-                "• Custom wallet names\n"
-                "• Priority notifications\n"
-                "• Detailed transaction history\n"
-                "• Advanced analytics\n\n"
-                "Thank you for your support! 🙏"
-            )
+        if premium_manager.is_premium(user_id):
+            wallet_name = update.message.text.strip()
+            if len(wallet_name) > 32:
+                update.message.reply_text(
+                    "Wallet name is too long! Please use max 32 characters.\n"
+                    "Try again or send /cancel to cancel"
+                )
+                return ADDING_NAME
         else:
+            wallet_name = context.user_data.get('temp_name')
+
+        wallet_address = context.user_data.get('temp_wallet')
+        if not wallet_address:
+            update.message.reply_text("Something went wrong. Please start over with /add")
+            return ConversationHandler.END
+
+        success = db_manager.add_wallet(user_id, wallet_address, wallet_name)
+        if success:
+            try:
+                success, webhook_id, addresses = get_webhook(HELIUS_WEBHOOK_ID)
+                add_webhook(user_id, wallet_address, webhook_id, addresses)
+            except Exception as e:
+                logger.error(f"Error updating webhook: {e}")
+
             message = (
-                "*🌟 Premium Features*\n\n"
-                "Upgrade to Premium and get:\n"
-                f"• Monitor up to {UserLimits.PREMIUM_WALLET_LIMIT} wallets\n"
-                "• Custom wallet names\n"
-                "• Priority notifications\n"
-                "• Detailed transaction history\n"
-                "• Advanced analytics\n\n"
-                "Contact @your_username to upgrade!"
+                f"✅ Successfully added wallet!\n\n"
+                f"*Name:* {wallet_name}\n"
+                f"*Address:* `{wallet_address[:4]}...{wallet_address[-4:]}`\n\n"
             )
-
-        keyboard = [[InlineKeyboardButton("🔙 Main Menu", callback_data="start")]]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-
-        if isinstance(update.callback_query, CallbackQuery):
-            update.callback_query.answer()
-            update.callback_query.edit_message_text(
+            
+            keyboard = [
+                [
+                    InlineKeyboardButton("➕ Add Another", callback_data="add_wallet"),
+                    InlineKeyboardButton("👀 Show All", callback_data="show_wallets")
+                ],
+                [InlineKeyboardButton("🔙 Main Menu", callback_data="start")]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            update.message.reply_text(
                 message,
                 reply_markup=reply_markup,
                 parse_mode=ParseMode.MARKDOWN
             )
         else:
             update.message.reply_text(
-                message,
-                reply_markup=reply_markup,
-                parse_mode=ParseMode.MARKDOWN
+                "This wallet is already in your list! Try another one 🔄"
             )
-
+        
+        return ConversationHandler.END
+        
     except Exception as e:
-        logger.error(f"Error in premium command: {e}")
-        update.message.reply_text("Sorry, something went wrong!")
+        logger.error(f"Error handling wallet name: {e}")
+        update.message.reply_text("Sorry, something went wrong. Please try again!")
+        return ConversationHandler.END
 
 def main() -> None:
     try:
@@ -758,13 +704,9 @@ def main() -> None:
         dispatcher.add_handler(add_wallet_handler)
         dispatcher.add_handler(delete_wallet_handler)
         dispatcher.add_handler(CommandHandler("show", show_wallets))
-        dispatcher.add_handler(CommandHandler("stats", stats_command))
-        dispatcher.add_handler(CommandHandler("premium", premium_command))
 
         # Add callback query handlers
         dispatcher.add_handler(CallbackQueryHandler(show_wallets, pattern='^show_wallets$'))
-        dispatcher.add_handler(CallbackQueryHandler(stats_command, pattern='^stats$'))
-        dispatcher.add_handler(CallbackQueryHandler(premium_command, pattern='^premium$'))
         dispatcher.add_handler(CallbackQueryHandler(start, pattern='^start$'))
 
         # Add error handler
