@@ -1,7 +1,3 @@
-from flask import Flask, request, jsonify
-from telegram import Bot
-from telegram.utils.request import Request
-from PIL import Image
 from io import BytesIO
 import re
 import os
@@ -10,14 +6,19 @@ from datetime import datetime
 import requests
 from pymongo import MongoClient
 
-# Import configurations and utilities
-from source.config import (
-    BOT_TOKEN, MONGODB_URI, HELIUS_KEY,
-    UserPlan, UserLimits
-)
-from source.utils.database_utils import DatabaseManager
-from source.utils.premium_utils import PremiumManager
+# Import configurations directly
+BOT_TOKEN = os.environ.get('BOT_TOKEN')
+MONGODB_URI = os.environ.get('MONGODB_URI')
+HELIUS_KEY = os.environ.get('HELIUS_KEY')
 
+class UserPlan:
+    FREE = "free"
+    PREMIUM = "premium"
+
+class UserLimits:
+    FREE_WALLET_LIMIT = 3
+    PREMIUM_WALLET_LIMIT = 10
+    
 # Set up logging
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
