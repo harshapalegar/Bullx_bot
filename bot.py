@@ -16,17 +16,12 @@ from telegram.error import BadRequest, Unauthorized, TimedOut
 # Add HTTP health check handler
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
-        if self.path == "/health" or self.path == "/":
-            self.send_response(200)
-            self.send_header('Content-type', 'application/json')
-            self.end_headers()
-            self.wfile.write(bytes('{"status":"healthy"}', "utf-8"))
-        else:
-            self.send_response(404)
-            self.end_headers()
+        self.send_response(200)
+        self.send_header('Content-type', 'text/plain')
+        self.end_headers()
+        self.wfile.write(b"OK")
         
     def log_message(self, format, *args):
-        # Suppress logging of health check requests
         pass
 
 def run_health_check_server():
@@ -38,17 +33,20 @@ def run_health_check_server():
     except Exception as e:
         logger.error(f"Error in health check server: {e}")
 
+# Start health check server in a separate thread
+health_check_thread = threading.Thread(target=run_health_check_server, daemon=True)
+health_check_thread.start()
+
 # Environment variables
 MONGODB_URI = os.environ.get('MONGODB_URI')
 BOT_TOKEN = os.environ.get('BOT_TOKEN')
 TOKEN = BOT_TOKEN
 HELIUS_KEY = os.environ.get('HELIUS_KEY')
 HELIUS_WEBHOOK_ID = os.environ.get('HELIUS_WEBHOOK_ID')
-WEBHOOK_URL = os.environ.get('WEBHOOK_URL')
 
 ADDING_WALLET, DELETING_WALLET = range(2)
 
-# Set up logging first
+# Set up logging
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO,
@@ -58,7 +56,6 @@ logger = logging.getLogger(__name__)
 
 try:
     client = MongoClient(MONGODB_URI, serverSelectionTimeoutMS=5000)
-    # Verify database connection
     client.server_info()
     db = client.sol_wallets
     wallets_collection = db.wallets
@@ -66,10 +63,6 @@ try:
 except Exception as e:
     logger.error(f"Failed to connect to MongoDB: {e}")
     raise
-
-# Start health check server in a separate thread
-health_check_thread = threading.Thread(target=run_health_check_server, daemon=True)
-health_check_thread.start()
 
 def is_solana_wallet_address(address):
     if not address:
@@ -152,14 +145,12 @@ def add_webhook(user_id, address, webhook_id, existing_addresses):
             
         url = f"https://api.helius.xyz/v0/webhooks/{webhook_id}?api-key={HELIUS_KEY}"
         
-        if not WEBHOOK_URL:
-            logger.error("WEBHOOK_URL environment variable not set")
-            return False
-
+        webhook_url = os.environ.get('WEBHOOK_URL', f'https://your-render-url/wallet')
+        
         new_addresses = existing_addresses + [address]
         data = {
             "accountAddresses": new_addresses,
-            "webhookURL": WEBHOOK_URL
+            "webhookURL": webhook_url
         }
         
         response = requests.put(url, json=data, timeout=10)
@@ -181,14 +172,12 @@ def delete_webhook(user_id, address, webhook_id, existing_addresses):
             
         url = f"https://api.helius.xyz/v0/webhooks/{webhook_id}?api-key={HELIUS_KEY}"
         
-        if not WEBHOOK_URL:
-            logger.error("WEBHOOK_URL environment variable not set")
-            return False
-
+        webhook_url = os.environ.get('WEBHOOK_URL', f'https://your-render-url/wallet')
+        
         new_addresses = [addr for addr in existing_addresses if addr != address]
         data = {
             "accountAddresses": new_addresses,
-            "webhookURL": WEBHOOK_URL
+            "webhookURL": webhook_url
         }
         
         response = requests.put(url, json=data, timeout=10)
@@ -219,7 +208,8 @@ def welcome_message() -> str:
     message = (
         "🤖 Ahoy there, Solana Wallet Wrangler! Welcome to Solana Wallet Xray Bot! 🤖\n\n"
         "I'm your trusty sidekick, here to help you juggle those wallets and keep an eye on transactions.\n"
-        "Once you've added your wallets, you can sit back and relax, as I'll swoop in with a snappy notification and a brief transaction summary every time your wallet makes a move on Solana. 🚀\n"
+        "Once you've added your wallets, you can sit back and relax, as I'll swoop in with a snappy notification "
+        "and a brief transaction summary every time your wallet makes a move on Solana. 🚀\n"
         "Have a blast using the bot! 😄\n\n"
         "Ready to rumble? Use the commands below and follow the prompts:"
     )
@@ -347,14 +337,16 @@ def add_wallet_finish(update: Update, context: CallbackContext) -> int:
         check_res, check_num_tx = check_wallet_transactions(wallet_address)
         if not check_res:
             update.message.reply_text(
-                f"Whoa, slow down Speedy Gonzales! 🏎️ We can only handle wallets with under 50 transactions per day. Your wallet's at {round(check_num_tx, 1)}. Let's pick another, shall we? 😉",
+                f"Whoa, slow down Speedy Gonzales! 🏎️ We can only handle wallets with under 50 transactions per day. "
+                f"Your wallet's at {round(check_num_tx, 1)}. Let's pick another, shall we? 😉",
                 reply_markup=reply_markup
             )
             return ADDING_WALLET
 
         if wallet_count_for_user(user_id) >= 5:
             update.message.reply_text(
-                "Oops! You've reached the wallet limit! It seems you're quite the collector, but we can only handle up to 5 wallets per user. Time to make some tough choices! 😄",
+                "Oops! You've reached the wallet limit! It seems you're quite the collector, but we can only handle "
+                "up to 5 wallets per user. Time to make some tough choices! 😄",
                 reply_markup=reply_markup
             )
             return ADDING_WALLET
@@ -386,7 +378,8 @@ def add_wallet_finish(update: Update, context: CallbackContext) -> int:
                 wallets_collection.insert_one(main)
                     
                 update.message.reply_text(
-                    "Huzzah! Your wallet has been added with a flourish! 🎉 Now you can sit back, relax, and enjoy your Solana experience as I keep an eye on your transactions. What's your next grand plan?",
+                    "Huzzah! Your wallet has been added with a flourish! 🎉 Now you can sit back, relax, and enjoy "
+                    "your Solana experience as I keep an eye on your transactions. What's your next grand plan?",
                     reply_markup=reply_markup
                 )
             else:
@@ -416,7 +409,6 @@ def delete_wallet_start(update: Update, context: CallbackContext) -> int:
 
 def delete_wallet_finish(update: Update, context: CallbackContext) -> int:
     try:
-        reply_markup = next(update, context)
         wallet_address = update.message.text
         user_id = update.effective_user.id
 
@@ -432,6 +424,7 @@ def delete_wallet_finish(update: Update, context: CallbackContext) -> int:
                 "address": wallet_address,
                 "status": "active"
             })
+        
         r_success = True
         if len(list(wallets_exist)) == 1:
             logging.info('deleting unique address')
@@ -447,6 +440,7 @@ def delete_wallet_finish(update: Update, context: CallbackContext) -> int:
                 "address": wallet_address,
                 "status": "active"
             })
+            
             if result.deleted_count == 0:
                 update.message.reply_text(
                     "Hmm, that wallet's either missing or not yours. Let's try something else, okay? 🕵️‍♀️",
@@ -504,8 +498,8 @@ def show_wallets(update: Update, context: CallbackContext) -> None:
 
 def main() -> None:
     try:
-        # Verify all required environment variables are set
-        required_vars = ['MONGODB_URI', 'BOT_TOKEN', 'HELIUS_KEY', 'HELIUS_WEBHOOK_ID', 'WEBHOOK_URL']
+        # Verify essential environment variables
+        required_vars = ['MONGODB_URI', 'BOT_TOKEN', 'HELIUS_KEY', 'HELIUS_WEBHOOK_ID']
         missing_vars = [var for var in required_vars if not os.environ.get(var)]
         if missing_vars:
             raise EnvironmentError(f"Missing required environment variables: {', '.join(missing_vars)}")
@@ -526,15 +520,14 @@ def main() -> None:
 
         dispatcher.add_handler(CommandHandler("start", start))
         dispatcher.add_handler(conv_handler)
-        
-        # Add error handler
         dispatcher.add_error_handler(error_handler)
 
         # Start the Bot
         logger.info("Starting bot...")
         updater.start_polling()
+        logger.info("Bot started successfully!")
         
-        # Run the bot until the user presses Ctrl-C
+        # Run until Ctrl+C
         updater.idle()
 
     except Exception as e:
