@@ -9,8 +9,12 @@ import logging
 from datetime import datetime
 import requests
 from pymongo import MongoClient
+from dotenv import load_dotenv
 
-# Import configurations directly
+# Load environment variables
+load_dotenv()
+
+# Environment variables
 BOT_TOKEN = os.environ.get('BOT_TOKEN')
 MONGODB_URI = os.environ.get('MONGODB_URI')
 HELIUS_KEY = os.environ.get('HELIUS_KEY')
@@ -23,71 +27,50 @@ class UserLimits:
     FREE_WALLET_LIMIT = 3
     PREMIUM_WALLET_LIMIT = 10
 
-# Add DatabaseManager class
-class DatabaseManager:
-    def __init__(self, db):
-        self.db = db
+# Set up logging
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO,
+    handlers=[logging.StreamHandler()]
+)
+logger = logging.getLogger(__name__)
 
-    def ensure_user_exists(self, user_id: str, username: str = None) -> None:
-        try:
-            existing_user = self.db.users.find_one({"user_id": str(user_id)})
-            if not existing_user:
-                self.db.users.insert_one({
-                    "user_id": str(user_id),
-                    "username": username,
-                    "plan": UserPlan.FREE,
-                    "joined_date": datetime.now(),
-                    "status": "active"
-                })
-                logger.info(f"Created new user: {user_id}")
-        except Exception as e:
-            logger.error(f"Error ensuring user exists: {e}")
+# Initialize MongoDB
+try:
+    client = MongoClient(MONGODB_URI, serverSelectionTimeoutMS=5000)
+    client.admin.command('ping')
+    db = client.sol_wallets
+    logger.info("Successfully connected to MongoDB")
+except Exception as e:
+    logger.error(f"Failed to connect to MongoDB: {e}")
+    raise
 
-    def get_user_stats(self, user_id: str) -> dict:
-        try:
-            active_wallets = self.db.wallets.count_documents({
-                "user_id": str(user_id),
-                "status": "active"
-            })
-            
-            today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
-            transactions_today = self.db.messages.count_documents({
-                "user": str(user_id),
-                "datetime": {"$gte": today}
-            })
-            
-            user_data = self.db.users.find_one({"user_id": str(user_id)}) or {
-                "plan": UserPlan.FREE,
-                "joined_date": datetime.now()
-            }
-            
+def format_number(number, decimals=2):
+    try:
+        if number >= 1_000_000:
+            return f"{number/1_000_000:.{decimals}f}M"
+        elif number >= 1_000:
+            return f"{number/1_000:.{decimals}f}K"
+        else:
+            return f"{number:.{decimals}f}"
+    except:
+        return str(number)
+
+def get_token_info(token_address):
+    try:
+        url = f"https://api.helius.xyz/v0/token-metadata?api-key={HELIUS_KEY}"
+        response = requests.post(url, json={"mintAccounts": [token_address]})
+        if response.status_code == 200:
+            data = response.json()[0]
             return {
-                "active_wallets": active_wallets,
-                "transactions_today": transactions_today,
-                "plan": user_data.get("plan", UserPlan.FREE),
-                "wallet_limit": UserLimits.PREMIUM_WALLET_LIMIT if user_data.get("plan") == UserPlan.PREMIUM else UserLimits.FREE_WALLET_LIMIT
+                "symbol": data.get("symbol", ""),
+                "name": data.get("name", ""),
+                "decimals": data.get("decimals", 9)
             }
-        except Exception as e:
-            logger.error(f"Error getting user stats: {e}")
-            return {
-                "active_wallets": 0,
-                "transactions_today": 0,
-                "plan": UserPlan.FREE,
-                "wallet_limit": UserLimits.FREE_WALLET_LIMIT
-            }
-
-# Add PremiumManager class
-class PremiumManager:
-    def __init__(self, db):
-        self.db = db
-
-    def is_premium(self, user_id: str) -> bool:
-        try:
-            user = self.db.users.find_one({"user_id": str(user_id)})
-            return user and user.get("plan") == UserPlan.PREMIUM
-        except Exception as e:
-            logger.error(f"Error checking premium status: {e}")
-            return False
+        return None
+    except Exception as e:
+        logger.error(f"Error getting token info: {e}")
+        return None
 
 def send_message_to_user(bot_token, user_id, message):
     try:
@@ -116,7 +99,7 @@ def send_image_to_user(bot_token, user_id, message, image_url):
     except Exception as e:
         logger.error(f"Error sending image to user {user_id}: {e}")
         send_message_to_user(bot_token, user_id, message)
-    
+
 def get_image(url):
     try:
         response = requests.get(url, timeout=10).content
@@ -140,6 +123,19 @@ def format_wallet_address(match_obj):
         logger.error(f"Error formatting wallet address: {e}")
         return match_obj.group(0)
 
+def get_token_price(token_address):
+    try:
+        url = f"https://api.helius.xyz/v0/token-metadata?api-key={HELIUS_KEY}"
+        response = requests.post(url, json={"mintAccounts": [token_address]})
+        if response.status_code == 200:
+            data = response.json()[0]
+            if 'price' in data:
+                return data['price']
+        return None
+    except Exception as e:
+        logger.error(f"Error getting token price: {e}")
+        return None
+
 def get_compressed_image(asset_id):
     try:
         url = f'https://rpc.helius.xyz/?api-key={HELIUS_KEY}'
@@ -149,11 +145,11 @@ def get_compressed_image(asset_id):
             "method": "getAsset",
             "params": [asset_id]
         }
-        r = requests.post(url, json=r_data, timeout=10)
-        if r.status_code != 200:
-            logger.error(f"Error response from Helius: {r.status_code}")
+        response = requests.post(url, json=r_data, timeout=10)
+        if response.status_code != 200:
+            logger.error(f"Error response from Helius: {response.status_code}")
             return ''
-        url_meta = r.json()['result']['content']['json_uri']
+        url_meta = response.json()['result']['content']['json_uri']
         r = requests.get(url=url_meta, timeout=10)
         if r.status_code != 200:
             logger.error(f"Error getting metadata: {r.status_code}")
@@ -201,160 +197,333 @@ def check_image(data):
         logger.error(f"Error checking image: {e}")
         return ''
 
+def process_token_transfers(transfers, tx_type):
+    try:
+        result = {
+            'amount_in': 0,
+            'amount_out': 0,
+            'token_in': None,
+            'token_out': None,
+            'usd_value': 0
+        }
+        
+        for transfer in transfers:
+            amount = float(transfer.get('tokenAmount', 0))
+            token_info = get_token_info(transfer.get('mint', ''))
+            
+            if token_info:
+                if transfer.get('tokenStandard') == 'Fungible':
+                    price = get_token_price(transfer.get('mint', ''))
+                    if price:
+                        result['usd_value'] += amount * price
+
+                    if 'symbol' in token_info:
+                        if tx_type == 'SWAP':
+                            if not result['token_in']:
+                                result['token_in'] = token_info
+                                result['amount_in'] = amount
+                            else:
+                                result['token_out'] = token_info
+                                result['amount_out'] = amount
+        
+        return result
+    except Exception as e:
+        logger.error(f"Error processing token transfers: {e}")
+        return None
+
 def create_message(data):
     try:
+        logger.info(f"Processing transaction data: {data}")
+        
         tx_type = data[0]['type'].replace("_", " ")
         tx = data[0]['signature']
         source = data[0]['source']
         description = data[0]['description']
 
+        # Process token transfers
+        token_data = process_token_transfers(data[0].get('tokenTransfers', []), tx_type)
+        
+        # Build message based on transaction type
+        if tx_type == "SWAP":
+            message = f"{'🔴 SELL' if source == 'RAYDIUM' else '🟢 BUY'} "
+            if token_data and token_data['token_in'] and token_data['token_out']:
+                message += (
+                    f"{token_data['token_in']['symbol']} on {source}\n\n"
+                    f"🔹 Amount: {format_number(token_data['amount_in'])} "
+                    f"{token_data['token_in']['symbol']}"
+                )
+                if token_data['usd_value'] > 0:
+                    message += f" (${format_number(token_data['usd_value'])})"
+                message += (
+                    f"\n🔹 For: {format_number(token_data['amount_out'])} "
+                    f"{token_data['token_out']['symbol']}"
+                )
+                
+                # Add token links
+                token_mint = data[0]['tokenTransfers'][0].get('mint', '')
+                if token_mint:
+                    message += (
+                        f"\n\n🔗 Links:\n"
+                        f"• [Birdeye](https://birdeye.so/token/{token_mint})\n"
+                        f"• [DexScreener](https://dexscreener.com/solana/{token_mint})\n"
+                        f"• [Solscan](https://solscan.io/token/{token_mint})"
+                    )
+        elif tx_type == "NFT SALE" or tx_type == "NFT PURCHASE":
+            symbol = ""
+            amount = 0
+            for transfer in data[0]['tokenTransfers']:
+                if transfer.get('tokenStandard') == 'NonFungible':
+                    symbol = transfer.get('symbol', '')
+                elif transfer.get('tokenStandard') == 'Fungible':
+                    amount = float(transfer.get('tokenAmount', 0))
+            
+            message = (
+                f"{'🔴 SOLD' if tx_type == 'NFT SALE' else '🟢 BOUGHT'} "
+                f"{symbol} on {source}\n"
+                f"💰 Price: {format_number(amount)} SOL"
+            )
+        else:
+            message = f"*{tx_type}* on {source}\n\n"
+            if description:
+                message += description
+
+        # Add transaction links
+        message += f"\n\n[XRAY](https://xray.helius.xyz/tx/{tx}) | [Solscan](https://solscan.io/tx/{tx})"
+
+        # Process accounts
         accounts = []
         for inst in data[0]["instructions"]:
-            accounts = accounts + inst["accounts"]
+            accounts.extend(inst["accounts"])
         
-        if len(data[0]['tokenTransfers']) > 0:
+        if data[0]['tokenTransfers']:
             for token in data[0]['tokenTransfers']:
                 accounts.append(token['fromUserAccount'])
                 accounts.append(token['toUserAccount'])
             accounts = list(set(accounts))
 
-        logger.info(f"Found accounts in transaction: {accounts}")
         image = check_image(data)
         
+        # Find affected wallets
         found_docs = list(db.wallets.find({
             "address": {"$in": accounts},
             "status": "active"
         }))
         
-        logger.info(f"Found wallet documents: {found_docs}")
-        found_users = [i['user_id'] for i in found_docs]
-        found_users = set(found_users)
+        found_users = list(set(doc['user_id'] for doc in found_docs))
         logger.info(f"Found users for notification: {found_users}")
         
         messages = []
         for user in found_users:
-            if source != "SYSTEM_PROGRAM":
-                message = f'*{tx_type}* on {source}'
-            else:
-                message = f'*{tx_type}*'
-            if len(description) > 0:
-                message = message + '\n\n' + data[0]['description']
-                user_wallets = [i['address'] for i in found_docs if i['user_id']==user]
-                
-                for user_wallet in user_wallets:
-                    if user_wallet not in message:
-                        continue
-                    wallet_info = next((doc for doc in found_docs if doc['address'] == user_wallet), None)
-                    wallet_name = wallet_info.get('name', f"{user_wallet[:4]}...{user_wallet[-4:]}")
-                    message = message.replace(user_wallet, f'*{wallet_name}*')
+            user_message = message
+            user_wallets = [doc for doc in found_docs if doc['user_id'] == user]
+            
+            # Replace wallet addresses with names
+            for wallet in user_wallets:
+                if wallet['address'] in user_message:
+                    wallet_name = wallet.get('name', f"{wallet['address'][:4]}...{wallet['address'][-4:]}")
+                    user_message = user_message.replace(
+                        wallet['address'], 
+                        f"*{wallet_name}*"
+                    )
 
-            formatted_text = re.sub(r'[A-Za-z0-9]{32,44}', format_wallet_address, message)
-            formatted_text = formatted_text + f'\n[XRAY](https://xray.helius.xyz/tx/{tx}) | [Solscan](https://solscan.io/tx/{tx})'
-            formatted_text = formatted_text.replace("#", "").replace("_", " ")
-            messages.append({'user': user, 'text': formatted_text, 'image': image})
+            # Format remaining addresses
+            user_message = re.sub(r'[A-Za-z0-9]{32,44}', format_wallet_address, user_message)
+            
+            messages.append({
+                'user': user,
+                'text': user_message,
+                'image': image,
+                'priority': db.users.find_one({"user_id": user, "plan": UserPlan.PREMIUM}) is not None
+            })
         
         return messages
     except Exception as e:
         logger.error(f"Error creating message: {e}")
+        logger.error(f"Data that caused error: {data}")
         return []
 
-# Set up logging
-logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO,
-    handlers=[logging.StreamHandler()]
-)
-logger = logging.getLogger(__name__)
-
-# Initialize MongoDB and managers
-try:
-    client = MongoClient(MONGODB_URI, serverSelectionTimeoutMS=5000)
-    client.admin.command('ping')
-    db = client.sol_wallets
-    logger.info("Successfully connected to MongoDB")
-    
-    # Initialize managers
-    db_manager = DatabaseManager(db)
-    premium_manager = PremiumManager(db)
-    
-except Exception as e:
-    logger.error(f"Failed to connect to MongoDB: {e}")
-    raise
-
+# Initialize Flask app
 app = Flask(__name__)
 
 @app.route('/', methods=['GET'])
 def health_check():
+    """Health check endpoint"""
     try:
+        # Test MongoDB connection
         client.admin.command('ping')
         mongo_status = "connected"
-    except Exception as e:
-        mongo_status = f"error: {str(e)}"
         
-    return jsonify({
-        "status": "ok",
-        "timestamp": datetime.now().isoformat(),
-        "mongo_status": mongo_status,
-        "environment": {
-            "MONGODB_URI": bool(MONGODB_URI),
-            "BOT_TOKEN": bool(BOT_TOKEN),
-            "HELIUS_KEY": bool(HELIUS_KEY)
-        }
-    }), 200
+        # Test Helius API
+        helius_status = "connected" if HELIUS_KEY else "not configured"
+        
+        return jsonify({
+            "status": "ok",
+            "timestamp": datetime.now().isoformat(),
+            "mongo_status": mongo_status,
+            "helius_status": helius_status,
+            "environment": {
+                "MONGODB_URI": bool(MONGODB_URI),
+                "BOT_TOKEN": bool(BOT_TOKEN),
+                "HELIUS_KEY": bool(HELIUS_KEY)
+            }
+        }), 200
+    except Exception as e:
+        logger.error(f"Health check failed: {e}")
+        return jsonify({
+            "status": "error",
+            "error": str(e),
+            "timestamp": datetime.now().isoformat()
+        }), 500
 
 @app.route('/webhook-health', methods=['GET'])
 def webhook_health():
-    return jsonify({
-        "status": "ok",
-        "timestamp": datetime.now().isoformat(),
-        "service": "solana-webhook"
-    }), 200
+    """Webhook specific health check"""
+    try:
+        # Get some basic stats
+        total_users = db.users.count_documents({"status": "active"})
+        total_wallets = db.wallets.count_documents({"status": "active"})
+        premium_users = db.users.count_documents({"plan": UserPlan.PREMIUM})
+        
+        return jsonify({
+            "status": "ok",
+            "timestamp": datetime.now().isoformat(),
+            "service": "solana-webhook",
+            "stats": {
+                "total_users": total_users,
+                "total_wallets": total_wallets,
+                "premium_users": premium_users
+            }
+        }), 200
+    except Exception as e:
+        logger.error(f"Webhook health check failed: {e}")
+        return jsonify({
+            "status": "error",
+            "error": str(e)
+        }), 500
+
+@app.route('/test-message', methods=['POST'])
+def test_message():
+    """Endpoint to test message formatting"""
+    try:
+        if not request.is_json:
+            return jsonify({"error": "Request must be JSON"}), 400
+
+        data = request.json
+        messages = create_message(data)
+        
+        return jsonify({
+            "status": "ok",
+            "messages": messages
+        }), 200
+    except Exception as e:
+        logger.error(f"Test message failed: {e}")
+        return jsonify({
+            "status": "error",
+            "error": str(e)
+        }), 500
 
 @app.route('/wallet', methods=['POST'])
 def handle_webhook():
+    """Main webhook endpoint"""
     try:
         logger.info(f"Received webhook request: {request.headers}")
+        
+        # Validate request
         if not request.is_json:
             logger.error("Invalid request: Not JSON")
             return jsonify({"error": "Invalid request"}), 400
 
         data = request.json
-        logger.info(f"Webhook data: {data}")
-        
         if not data:
             logger.error("Invalid request: Empty data")
             return jsonify({"error": "Empty data"}), 400
+
+        logger.info(f"Processing webhook data: {data}")
         
+        # Create messages for all affected users
         messages = create_message(data)
         logger.info(f"Created messages: {messages}")
 
+        # Send messages to users
         for message in messages:
             try:
+                # Save message to database
                 db_entry = {
                     "user": message['user'],
                     "message": message['text'],
-                    "datetime": datetime.now()
+                    "datetime": datetime.now(),
+                    "priority": message.get('priority', False),
+                    "tx_signature": data[0].get('signature', ''),
+                    "tx_type": data[0].get('type', '')
                 }
                 db.messages.insert_one(db_entry)
+                logger.info(f"Saved message to database: {db_entry['_id']}")
 
-                if len(message['image']) > 0:
-                    try:
-                        send_image_to_user(BOT_TOKEN, message['user'], message['text'], message['image'])
-                    except Exception as e:
-                        logger.error(f"Error sending image, falling back to text: {e}")
-                        send_message_to_user(BOT_TOKEN, message['user'], message['text'])    
-                else:
-                    send_message_to_user(BOT_TOKEN, message['user'], message['text'])
+                # Send notification
+                try:
+                    if message.get('image'):
+                        send_image_to_user(
+                            BOT_TOKEN,
+                            message['user'],
+                            message['text'],
+                            message['image']
+                        )
+                    else:
+                        send_message_to_user(
+                            BOT_TOKEN,
+                            message['user'],
+                            message['text']
+                        )
+                except Exception as e:
+                    logger.error(f"Error sending notification: {e}")
+                    # Try sending as text if image fails
+                    if message.get('image'):
+                        send_message_to_user(
+                            BOT_TOKEN,
+                            message['user'],
+                            message['text']
+                        )
+                        
             except Exception as e:
-                logger.error(f"Error processing message: {e}")
+                logger.error(f"Error processing message for user {message['user']}: {e}")
+                continue
 
         logger.info('Webhook processed successfully')
-        return jsonify({"status": "ok"}), 200
+        return jsonify({
+            "status": "ok",
+            "messages_sent": len(messages)
+        }), 200
 
     except Exception as e:
         logger.error(f"Error handling webhook: {e}")
-        return jsonify({"error": "Internal server error"}), 500
+        return jsonify({
+            "status": "error",
+            "error": str(e)
+        }), 500
+
+# Error handlers
+@app.errorhandler(404)
+def not_found(e):
+    return jsonify({"error": "Not found"}), 404
+
+@app.errorhandler(500)
+def server_error(e):
+    return jsonify({"error": "Internal server error"}), 500
 
 if __name__ == '__main__':
+    # Get port from environment variable or use default
     port = int(os.environ.get('PORT', 5002))
-    app.run(debug=False, host='0.0.0.0', port=port)
+    
+    # Verify required environment variables
+    required_vars = ['MONGODB_URI', 'BOT_TOKEN', 'HELIUS_KEY']
+    missing_vars = [var for var in required_vars if not os.environ.get(var)]
+    if missing_vars:
+        raise EnvironmentError(f"Missing required environment variables: {', '.join(missing_vars)}")
+    
+    # Start Flask app
+    logger.info(f"Starting server on port {port}")
+    app.run(
+        host='0.0.0.0',
+        port=port,
+        debug=False
+    )
